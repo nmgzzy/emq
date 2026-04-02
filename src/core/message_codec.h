@@ -1,0 +1,142 @@
+#pragma once
+#include "embedmq/types.h"
+#include "embedmq/qos.h"
+#include "../util/crc32.h"
+#include <cstring>
+#include <vector>
+#include <chrono>
+
+namespace embedmq {
+
+constexpr uint16_t EMBEDMQ_MAGIC     = 0xEBDC;
+constexpr uint8_t  EMBEDMQ_VERSION   = 1;
+
+// WireHeader 实际占用 40 字节（#pragma pack 保证无填充）
+// magic(2)+version(1)+msgType(1)+qosLevel(1)+flags(1)+sourceId(2)
+// +destId(2)+topicLen(2)+sequenceId(4)+correlationId(4)
+// +timestamp(8)+serializerId(1)+reserved(3)+payloadLen(4)+checksum(4) = 40
+constexpr size_t   HEADER_FIXED_SIZE = 40;
+
+#pragma pack(push, 1)
+struct WireHeader {
+    uint16_t magic;
+    uint8_t  version;
+    uint8_t  msgType;
+    uint8_t  qosLevel;
+    uint8_t  flags;
+    uint16_t sourceId;
+    uint16_t destId;
+    uint16_t topicLen;
+    uint32_t sequenceId;
+    uint32_t correlationId;
+    uint64_t timestamp;
+    uint8_t  serializerId;
+    uint8_t  reserved[3];
+    uint32_t payloadLen;
+    uint32_t checksum;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(WireHeader) == HEADER_FIXED_SIZE, "WireHeader size mismatch");
+
+class MessageCodec {
+public:
+    static std::vector<uint8_t> encode(
+        MessageType type,
+        uint16_t sourceId,
+        uint16_t destId,
+        const std::string& topic,
+        const Payload& payload,
+        const QoSProfile& qos,
+        uint32_t sequenceId,
+        uint32_t correlationId = 0,
+        uint8_t  flags         = 0,
+        uint8_t  serializerId  = 0)
+    {
+        WireHeader header{};
+        header.magic         = EMBEDMQ_MAGIC;
+        header.version       = EMBEDMQ_VERSION;
+        header.msgType       = static_cast<uint8_t>(type);
+        header.qosLevel      = static_cast<uint8_t>(qos.level);
+        header.flags         = flags;
+        header.sourceId      = sourceId;
+        header.destId        = destId;
+        header.topicLen      = static_cast<uint16_t>(topic.size());
+        header.sequenceId    = sequenceId;
+        header.correlationId = correlationId;
+        header.timestamp     = currentTimestampNs();
+        header.serializerId  = serializerId;
+        header.payloadLen    = static_cast<uint32_t>(payload.size());
+        header.checksum      = 0;
+
+        size_t totalSize = HEADER_FIXED_SIZE + topic.size() + payload.size();
+        std::vector<uint8_t> buffer(totalSize);
+
+        std::memcpy(buffer.data(), &header, HEADER_FIXED_SIZE);
+        if (!topic.empty())
+            std::memcpy(buffer.data() + HEADER_FIXED_SIZE, topic.data(), topic.size());
+        if (payload.size() > 0)
+            std::memcpy(buffer.data() + HEADER_FIXED_SIZE + topic.size(),
+                        payload.data(), payload.size());
+
+        uint32_t crc = util::crc32(buffer.data() + 4, totalSize - 4);
+        reinterpret_cast<WireHeader*>(buffer.data())->checksum = crc;
+
+        return buffer;
+    }
+
+    struct DecodeResult {
+        bool       valid{false};
+        WireHeader header{};
+        std::string topic;
+        Payload    payload;
+    };
+
+    static DecodeResult decode(const uint8_t* data, size_t size) {
+        DecodeResult result;
+        if (size < HEADER_FIXED_SIZE) return result;
+
+        std::memcpy(&result.header, data, HEADER_FIXED_SIZE);
+
+        if (result.header.magic   != EMBEDMQ_MAGIC)   return result;
+        if (result.header.version != EMBEDMQ_VERSION) return result;
+
+        size_t expectedSize = HEADER_FIXED_SIZE +
+                              result.header.topicLen +
+                              result.header.payloadLen;
+        if (size < expectedSize) return result;
+
+        // CRC32 验证
+        uint32_t savedCrc = result.header.checksum;
+        reinterpret_cast<WireHeader*>(
+            const_cast<uint8_t*>(data))->checksum = 0;
+        uint32_t calcCrc = util::crc32(data + 4, expectedSize - 4);
+        reinterpret_cast<WireHeader*>(
+            const_cast<uint8_t*>(data))->checksum = savedCrc;
+
+        if (calcCrc != savedCrc) return result;
+
+        result.topic.assign(
+            reinterpret_cast<const char*>(data + HEADER_FIXED_SIZE),
+            result.header.topicLen);
+
+        if (result.header.payloadLen > 0) {
+            result.payload = Payload(
+                data + HEADER_FIXED_SIZE + result.header.topicLen,
+                result.header.payloadLen);
+        }
+
+        result.valid = true;
+        return result;
+    }
+
+private:
+    static uint64_t currentTimestampNs() {
+        auto now = std::chrono::high_resolution_clock::now();
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch()).count());
+    }
+};
+
+} // namespace embedmq
