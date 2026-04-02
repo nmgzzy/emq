@@ -34,8 +34,7 @@ void Participant::Impl::init() {
 
     transportMgr = std::make_unique<TransportManager>();
 
-    if (config.transport.enableUdp)
-        transportMgr->registerDefaultTransports(config);
+    transportMgr->registerDefaultTransports(config);
 
     transportMgr->initAll(config);
 
@@ -54,9 +53,20 @@ void Participant::Impl::init() {
         if (peerEventCb) peerEventCb(peerId, peerName, false);
     });
 
-    // 将传输层接收数据转发给 MessageBus
+    // 将传输层接收数据按消息类型分发给 DiscoveryAgent 或 MessageBus
     transportMgr->setRecvCallback([this](const Endpoint& from,
                                           const uint8_t* data, size_t size) {
+        if (size >= 4) {
+            auto msgType = static_cast<MessageType>(data[3]);
+            if (msgType == MessageType::ANNOUNCE   ||
+                msgType == MessageType::HEARTBEAT  ||
+                msgType == MessageType::FAREWELL   ||
+                msgType == MessageType::DISCOVER_REQ ||
+                msgType == MessageType::DISCOVER_RSP) {
+                discovery->onDiscoveryMessage(from, data, size);
+                return;
+            }
+        }
         messageBus->onReceived(from, data, size);
     });
 

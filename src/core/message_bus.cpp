@@ -61,6 +61,7 @@ struct Requester::Impl {
     std::string  service;
     QoSProfile   qos;
     MessageBus*  bus{nullptr};
+    uint32_t     lastCorrId{0};
 };
 
 Requester::Requester(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -74,11 +75,16 @@ std::optional<Payload> Requester::request(
     if (fut.wait_for(timeout) == std::future_status::ready) {
         return fut.get();
     }
+    if (impl_->lastCorrId != 0) {
+        impl_->bus->cancelPendingRequest(impl_->lastCorrId);
+    }
     return std::nullopt;
 }
 
 std::future<Payload> Requester::requestAsync(const Payload& payload) {
-    return impl_->bus->sendRequest(impl_->service, payload, impl_->qos);
+    impl_->lastCorrId = impl_->bus->corrCounter_++;
+    return impl_->bus->sendRequest(impl_->service, payload, impl_->qos,
+                                    impl_->lastCorrId);
 }
 
 
@@ -197,15 +203,21 @@ std::unique_ptr<Requester> MessageBus::createRequester(
 std::unique_ptr<Replier> MessageBus::createReplier(
     const std::string& service, RequestHandler handler, const QoSProfile& qos)
 {
-    {
-        std::lock_guard<std::mutex> lock(serviceMutex_);
-        serviceHandlers_[service] = std::move(handler);
-    }
-
     auto impl = std::make_unique<Replier::Impl>();
     impl->service = service;
     impl->qos     = qos;
     impl->bus     = this;
+
+    auto* implPtr = impl.get();
+    {
+        std::lock_guard<std::mutex> lock(serviceMutex_);
+        serviceHandlers_[service] = [implPtr, h = std::move(handler)](
+            const ReceivedMessage& req) -> Payload {
+            implPtr->reqCount++;
+            return h(req);
+        };
+    }
+
     return std::unique_ptr<Replier>(new Replier(std::move(impl)));
 }
 
@@ -255,21 +267,20 @@ bool MessageBus::publish(const std::string& topic,
         }
     }
 
-    if (!targets.empty()) {
+    for (auto& ep : targets) {
+        uint32_t epSeqId = seqCounter_++;
         auto data = MessageCodec::encode(
             MessageType::PUBLISH, nodeId_, 0xFFFF,
-            topic, payload, qos, seqId, 0, flags);
+            topic, payload, qos, epSeqId, 0, flags);
 
-        for (auto& ep : targets) {
-            if (transportMgr_) transportMgr_->send(ep, data.data(), data.size());
+        if (transportMgr_) transportMgr_->send(ep, data.data(), data.size());
 
-            if (qos.level >= QoSLevel::Reliable) {
-                qosEngine_.addPending(seqId, data, qos,
-                    [this, ep](const std::vector<uint8_t>& d) {
-                        if (transportMgr_)
-                            transportMgr_->send(ep, d.data(), d.size());
-                    });
-            }
+        if (qos.level >= QoSLevel::Reliable) {
+            qosEngine_.addPending(epSeqId, data, qos,
+                [this, ep](const std::vector<uint8_t>& d) {
+                    if (transportMgr_)
+                        transportMgr_->send(ep, d.data(), d.size());
+                });
         }
     }
 
@@ -409,7 +420,14 @@ void MessageBus::sendReply(const Endpoint& to, uint32_t correlationId,
 }
 
 std::vector<std::string> MessageBus::localTopics() const {
-    return router_.allTopics();
+    auto topics = router_.allTopics();
+    {
+        std::lock_guard<std::mutex> lock(serviceMutex_);
+        for (auto& [svc, _] : serviceHandlers_) {
+            topics.push_back("$SVC/" + svc);
+        }
+    }
+    return topics;
 }
 
 void MessageBus::removeLocalSubscription(uint64_t subId) {
@@ -421,12 +439,16 @@ void MessageBus::removeServiceHandler(const std::string& service) {
     serviceHandlers_.erase(service);
 }
 
+void MessageBus::cancelPendingRequest(uint32_t corrId) {
+    std::lock_guard<std::mutex> lock(pendingReqMutex_);
+    pendingRequests_.erase(corrId);
+}
+
 std::future<Payload> MessageBus::sendRequest(const std::string& service,
                                                const Payload& payload,
-                                               const QoSProfile& qos)
+                                               const QoSProfile& qos,
+                                               uint32_t corrId)
 {
-    uint32_t corrId = corrCounter_++;
-
     std::promise<Payload> promise;
     auto future = promise.get_future();
 
@@ -446,10 +468,10 @@ std::future<Payload> MessageBus::sendRequest(const std::string& service,
     if (handler) {
         // 本地服务：直接调用
         ReceivedMessage req;
-        req.topic        = service;
-        req.payload      = payload;
-        req.sourceId     = nodeId_;
-        req.sequenceId   = seqCounter_++;
+        req.topic         = service;
+        req.payload       = payload;
+        req.sourceId      = nodeId_;
+        req.sequenceId    = seqCounter_++;
         req.correlationId = corrId;
         Payload response  = handler(req);
 
@@ -460,9 +482,31 @@ std::future<Payload> MessageBus::sendRequest(const std::string& service,
             pendingRequests_.erase(it);
         }
     } else {
-        // 远端服务：通过网络发送
-        publish("$SVC/" + service, payload, qos, 0);
-        // 等待回复，通过 onReceived 触发 promise
+        // 远端服务：编码为 REQUEST 并发送，携带 correlationId
+        std::string svcTopic = "$SVC/" + service;
+        std::vector<Endpoint> targets;
+        {
+            std::lock_guard<std::mutex> lock(peerMutex_);
+            for (auto& [id, peer] : peers_) {
+                for (auto& t : peer.subscribedTopics) {
+                    if (t == svcTopic) {
+                        if (!peer.endpoints.empty())
+                            targets.push_back(peer.endpoints.front());
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!targets.empty()) {
+            uint32_t seqId = seqCounter_++;
+            auto data = MessageCodec::encode(
+                MessageType::REQUEST, nodeId_, 0xFFFF,
+                svcTopic, payload, qos, seqId, corrId);
+            for (auto& ep : targets) {
+                if (transportMgr_) transportMgr_->send(ep, data.data(), data.size());
+            }
+        }
     }
 
     return future;

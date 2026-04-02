@@ -1,3 +1,4 @@
+#define EMQ_TEST_MODULE "req_rep"
 #include "test_framework.h"
 #include "embedmq/embedmq.h"
 #include <atomic>
@@ -75,10 +76,7 @@ TEST(req_rep_request_count) {
     req->request(Payload("1"), std::chrono::milliseconds(500));
     req->request(Payload("2"), std::chrono::milliseconds(500));
 
-    // requestCount 统计
-    CHECK_GE(rep->requestCount(), 0u); // 简化：只验证不崩溃
+    CHECK_EQ(rep->requestCount(), 2u);
 
     p->shutdown();
 }
-
-int main() { return RUN_ALL_TESTS(); }

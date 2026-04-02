@@ -1,3 +1,4 @@
+#define EMQ_TEST_MODULE "message_codec"
 #include "test_framework.h"
 #include "../src/core/message_codec.h"
 #include <cstring>
@@ -92,5 +93,3 @@ TEST(large_payload) {
     CHECK_TRUE(result.valid);
     CHECK_EQ(result.payload.size(), bigData.size());
 }
-
-int main() { return RUN_ALL_TESTS(); }

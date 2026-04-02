@@ -93,19 +93,16 @@ private:
     void tick() {
         std::unique_lock<std::mutex> lock(mutex_);
         currentSlot_ = (currentSlot_ + 1) % SLOT_COUNT;
-        auto timers  = std::move(slots_[currentSlot_]);
+        auto timers   = std::move(slots_[currentSlot_]);
         slots_[currentSlot_].clear();
+        auto cancelled = std::move(cancelSet_);
+        cancelSet_.clear();
         lock.unlock();
 
         for (auto& t : timers) {
-            if (cancelSet_.count(t.id)) {
-                std::lock_guard<std::mutex> l(mutex_);
-                cancelSet_.erase(t.id);
-                continue;
-            }
+            if (cancelled.count(t.id)) continue;
             t.cb();
             if (t.intervalMs > 0) {
-                // 重新加入
                 addTimer(t.intervalMs, t.intervalMs, t.cb);
             }
         }

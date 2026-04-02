@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)]()
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)]()
 [![Build](https://img.shields.io/badge/build-xmake-green)]()
-[![Phase](https://img.shields.io/badge/phase-1%2B2%20completed-brightgreen)]()
+[![Phase](https://img.shields.io/badge/phase-2%20in%20progress-yellow)]()
 [![Tests](https://img.shields.io/badge/tests-101%20passed-brightgreen)]()
 
 ---
@@ -20,7 +20,7 @@ EmbedMQ 是一个**去中心化、插件化传输层、支持发布-订阅与请
 |------|------|
 | 去中心化 P2P | 无需 Broker/服务器，节点间对等通信 |
 | 双通信模式 | 发布-订阅（1:N） + 请求-响应（1:1） |
-| 传输插件化 | UDP / TCP / 共享内存 / 串口 / BLE 均以插件形式接入 |
+| 传输插件化 | UDP（已实现）/ TCP（实验性）；共享内存·串口·BLE 规划中，均以插件形式接入 |
 | 自发现 | UDP 多播（239.255.0.1:19900），无需手动配置对端地址 |
 | 可靠传输 | QoS 0/1/2：BestEffort / ACK重传 / 恰好一次 |
 | 跨平台 PAL | 通过平台抽象层统一 Windows / Linux / macOS 差异 |
@@ -43,7 +43,7 @@ EmbedMQ 是一个**去中心化、插件化传输层、支持发布-订阅与请
 
 ```bash
 # 克隆仓库
-git clone https://github.com/your-org/embedmq.git
+git clone https://github.com/<your-org>/embedmq.git
 cd embedmq
 
 # 构建（Debug）
@@ -68,12 +68,18 @@ xmake run example_req_rep
 ### 运行单元测试
 
 ```bash
-xmake run test_topic_router
-xmake run test_message_codec
-xmake run test_qos_engine
-xmake run test_pal
-xmake run test_pub_sub
-xmake run test_req_rep
+# 运行全部测试（6 个模块，41 个用例）
+xmake run emq_tests
+
+# 运行指定模块
+xmake run emq_tests pal
+xmake run emq_tests pub_sub req_rep
+
+# 列出所有可用模块
+xmake run emq_tests --list
+
+# 查看帮助
+xmake run emq_tests --help
 ```
 
 ---
@@ -256,14 +262,15 @@ embedmq/
 │       ├── udp_transport.h/cpp   # UDP 单播 + 多播
 │       └── tcp_transport.h/cpp   # TCP（长度前缀帧化）
 │
-├── tests/                        # 单元测试（自带轻量框架）
-│   ├── test_framework.h
-│   ├── test_topic_router.cpp
-│   ├── test_message_codec.cpp
-│   ├── test_qos_engine.cpp
-│   ├── test_pal.cpp
-│   ├── test_pub_sub.cpp
-│   └── test_req_rep.cpp
+├── tests/                        # 单元测试（统一可执行文件 emq_tests）
+│   ├── test_framework.h          # 轻量框架（模块注册 + 命令行过滤）
+│   ├── test_main.cpp             # 统一入口
+│   ├── test_topic_router.cpp     # 模块: topic_router
+│   ├── test_message_codec.cpp    # 模块: message_codec
+│   ├── test_qos_engine.cpp       # 模块: qos_engine
+│   ├── test_pal.cpp              # 模块: pal
+│   ├── test_pub_sub.cpp          # 模块: pub_sub
+│   └── test_req_rep.cpp          # 模块: req_rep
 │
 ├── examples/
 │   ├── pub_sub/main.cpp          # 传感器数据发布订阅
@@ -380,9 +387,9 @@ participant->registerTransport("can",
 | Pub/Sub | ✅ | ✅ | ✅ | ✅ |
 | Req/Rep | ✅ | ❌ | ✅ | ❌ |
 | 传输插件化 | ✅ | ❌ | ❌ | 有限 |
-| 串口/BLE 支持 | ✅ | ❌ | ❌ | ❌ |
+| 串口/BLE 支持 | 📋 规划中 | ❌ | ❌ | ❌ |
 | 保留消息 | ✅ | ✅ | ❌ | ✅ |
-| 遗嘱消息 | ✅ | ✅ | ❌ | ✅ |
+| 遗嘱消息 | 📋 规划中 | ✅ | ❌ | ✅ |
 | 通配符 | ✅ `* #` | ✅ | 前缀 | 有限 |
 | 库大小 | ~300 KB | ~200 KB | ~500 KB | ~5 MB |
 | 第三方依赖 | **零** | 有 | 有 | 有 |
@@ -395,7 +402,7 @@ participant->registerTransport("can",
 | 阶段 | 版本 | 状态 | 内容 |
 |------|------|------|------|
 | Phase 1 | v0.1 | ✅ **已完成** | PAL 层、UDP、Pub/Sub、Req/Rep、QoS 0、自发现 |
-| Phase 2 | v0.2 | ✅ **已完成** | QoS 1/2、通配符、保留/遗嘱消息、心跳、TCP |
+| Phase 2 | v0.2 | 🚧 **进行中** | QoS 1/2、通配符、保留消息、心跳、TCP（实验性）；遗嘱消息待实现 |
 | Phase 3 | v0.3 | 📋 规划中 | 共享内存 Transport、零拷贝、无锁队列优化、内存池 |
 | Phase 4 | v0.4 | 📋 规划中 | 串口 Transport、BLE Transport、大消息分片 |
 | Phase 5 | v0.5 | 📋 规划中 | C ABI、Python 绑定、命令行监控工具 |

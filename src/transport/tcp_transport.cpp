@@ -57,12 +57,22 @@ void TcpTransport::shutdown() {
     }
 }
 
+bool TcpTransport::sendAll(SockFd fd, const uint8_t* data, size_t size) {
+    size_t sent = 0;
+    while (sent < size) {
+        int n = platform::SocketApi::send(fd, data + sent,
+                                           static_cast<int>(size - sent));
+        if (n <= 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
 bool TcpTransport::send(const Endpoint& to, const uint8_t* data, size_t size) {
     if (!active_) return false;
     SockFd fd = getOrConnect(to);
     if (fd == INVALID_SOCK) return false;
 
-    // 4-byte length prefix
     uint32_t len = static_cast<uint32_t>(size);
     uint8_t lenBuf[4];
     lenBuf[0] = (len >> 24) & 0xFF;
@@ -70,9 +80,8 @@ bool TcpTransport::send(const Endpoint& to, const uint8_t* data, size_t size) {
     lenBuf[2] = (len >>  8) & 0xFF;
     lenBuf[3] =  len        & 0xFF;
 
-    platform::SocketApi::send(fd, lenBuf, 4);
-    return platform::SocketApi::send(fd, data, static_cast<int>(size)) ==
-           static_cast<int>(size);
+    if (!sendAll(fd, lenBuf, 4)) return false;
+    return sendAll(fd, data, size);
 }
 
 void TcpTransport::setRecvCallback(TransportRecvCallback cb) {

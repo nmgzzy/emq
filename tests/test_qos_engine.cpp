@@ -1,3 +1,4 @@
+#define EMQ_TEST_MODULE "qos_engine"
 #include "test_framework.h"
 #include "../src/core/qos_engine.h"
 #include <thread>
@@ -84,5 +85,3 @@ TEST(multiple_pending) {
     engine.onAck(3);
     CHECK_EQ(engine.pendingCount(), 4u);
 }
-
-int main() { return RUN_ALL_TESTS(); }

@@ -106,13 +106,16 @@ public:
                               result.header.payloadLen;
         if (size < expectedSize) return result;
 
-        // CRC32 验证
+        // CRC32 验证（不修改输入缓冲区）
         uint32_t savedCrc = result.header.checksum;
-        reinterpret_cast<WireHeader*>(
-            const_cast<uint8_t*>(data))->checksum = 0;
-        uint32_t calcCrc = util::crc32(data + 4, expectedSize - 4);
-        reinterpret_cast<WireHeader*>(
-            const_cast<uint8_t*>(data))->checksum = savedCrc;
+        constexpr size_t CHECKSUM_OFFSET = 36; // offsetof(WireHeader, checksum)
+        static const uint8_t ZERO4[4] = {0, 0, 0, 0};
+        uint32_t crcState = 0xFFFFFFFFu;
+        crcState = util::crc32_update(crcState, data + 4, CHECKSUM_OFFSET - 4);
+        crcState = util::crc32_update(crcState, ZERO4, 4);
+        crcState = util::crc32_update(crcState, data + CHECKSUM_OFFSET + 4,
+                                       expectedSize - CHECKSUM_OFFSET - 4);
+        uint32_t calcCrc = ~crcState;
 
         if (calcCrc != savedCrc) return result;
 

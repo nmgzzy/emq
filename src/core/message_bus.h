@@ -67,7 +67,10 @@ public:
     // ---- 内部：发起请求 ----
     std::future<Payload> sendRequest(const std::string& service,
                                       const Payload& payload,
-                                      const QoSProfile& qos);
+                                      const QoSProfile& qos,
+                                      uint32_t corrId);
+
+    void cancelPendingRequest(uint32_t corrId);
 
     uint16_t nodeId() const { return nodeId_; }
 
@@ -102,7 +105,7 @@ private:
     std::unordered_map<uint32_t, std::promise<Payload>> pendingRequests_;
 
     // service handler 注册
-    std::mutex serviceMutex_;
+    mutable std::mutex serviceMutex_;
     std::unordered_map<std::string, RequestHandler> serviceHandlers_;
 
     // 对端信息 -> endpoint 映射

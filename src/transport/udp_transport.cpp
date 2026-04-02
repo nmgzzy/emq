@@ -72,6 +72,10 @@ bool UdpTransport::init(const std::string& config) {
 #endif
         if (platform::SocketApi::bindAny(multicastFd_, multicastPort_)) {
             platform::SocketApi::joinMulticast(multicastFd_, multicastGroup_);
+        } else {
+            EMQ_LOG_W("UDP", "Failed to bind multicast socket, disabling multicast recv");
+            platform::SocketApi::close(multicastFd_);
+            multicastFd_ = INVALID_SOCK;
         }
     }
 
@@ -84,11 +88,11 @@ bool UdpTransport::init(const std::string& config) {
 
 void UdpTransport::shutdown() {
     if (active_.exchange(false)) {
+        if (recvThread_.joinable()) recvThread_.join();
         if (unicastFd_   != INVALID_SOCK) platform::SocketApi::close(unicastFd_);
         if (multicastFd_ != INVALID_SOCK) platform::SocketApi::close(multicastFd_);
         unicastFd_   = INVALID_SOCK;
         multicastFd_ = INVALID_SOCK;
-        if (recvThread_.joinable()) recvThread_.join();
         platform::SocketApi::cleanup();
     }
 }

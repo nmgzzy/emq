@@ -1,3 +1,4 @@
+#define EMQ_TEST_MODULE "topic_router"
 #include "test_framework.h"
 #include "../src/core/topic_router.h"
 #include <atomic>
@@ -111,5 +112,3 @@ TEST(multiple_subscribers) {
     CHECK_EQ(c1.load(), 1);
     CHECK_EQ(c2.load(), 1);
 }
-
-int main() { return RUN_ALL_TESTS(); }

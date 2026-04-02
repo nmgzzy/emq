@@ -83,31 +83,27 @@ target("embedmq")
         add_syslinks("ws2_32", "mswsock", "advapi32")
     end
 
--- ---- 单元测试 ----
+-- ---- 单元测试（统一可执行文件）----
 if has_config("build_tests") then
-    -- 测试辅助宏
-    local function add_test(name, src)
-        target(name)
-            set_kind("binary")
-            add_deps("embedmq")
-            add_includedirs("include", "src")
-            add_files(src)
-            if is_os("linux") then
-                add_syslinks("pthread", "rt")
-            elseif is_os("macosx") then
-                add_syslinks("pthread")
-            elseif is_os("windows") then
-                add_syslinks("ws2_32", "mswsock", "advapi32")
-            end
-            set_group("tests")
-    end
-
-    add_test("test_topic_router",  "tests/test_topic_router.cpp")
-    add_test("test_message_codec", "tests/test_message_codec.cpp")
-    add_test("test_qos_engine",    "tests/test_qos_engine.cpp")
-    add_test("test_pal",           "tests/test_pal.cpp")
-    add_test("test_pub_sub",       "tests/test_pub_sub.cpp")
-    add_test("test_req_rep",       "tests/test_req_rep.cpp")
+    target("emq_tests")
+        set_kind("binary")
+        add_deps("embedmq")
+        add_includedirs("include", "src")
+        add_files("tests/test_main.cpp")
+        add_files("tests/test_topic_router.cpp")
+        add_files("tests/test_message_codec.cpp")
+        add_files("tests/test_qos_engine.cpp")
+        add_files("tests/test_pal.cpp")
+        add_files("tests/test_pub_sub.cpp")
+        add_files("tests/test_req_rep.cpp")
+        if is_os("linux") then
+            add_syslinks("pthread", "rt")
+        elseif is_os("macosx") then
+            add_syslinks("pthread")
+        elseif is_os("windows") then
+            add_syslinks("ws2_32", "mswsock", "advapi32")
+        end
+        set_group("tests")
 end
 
 -- ---- 示例程序 ----

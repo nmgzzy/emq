@@ -1,3 +1,4 @@
+#define EMQ_TEST_MODULE "pub_sub"
 #include "test_framework.h"
 #include "embedmq/embedmq.h"
 #include <atomic>
@@ -132,5 +133,3 @@ TEST(message_count) {
     CHECK_EQ(sub->messageCount(), 5u);
     p->shutdown();
 }
-
-int main() { return RUN_ALL_TESTS(); }

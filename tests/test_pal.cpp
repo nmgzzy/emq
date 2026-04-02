@@ -1,3 +1,4 @@
+#define EMQ_TEST_MODULE "pal"
 #include "test_framework.h"
 #include "../src/platform/process.h"
 #include "../src/util/ring_buffer.h"
@@ -102,5 +103,3 @@ TEST(timer_wheel_periodic) {
     tw.stop();
     CHECK_GE(fired.load(), 2); // 至少触发2次
 }
-
-int main() { return RUN_ALL_TESTS(); }

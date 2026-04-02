@@ -1,5 +1,8 @@
 #include "transport_manager.h"
 #include "udp_transport.h"
+#ifdef EMBEDMQ_ENABLE_TCP
+#include "tcp_transport.h"
+#endif
 #include "../util/logger.h"
 
 namespace embedmq {
@@ -15,6 +18,11 @@ void TransportManager::registerDefaultTransports(const ParticipantConfig& config
     if (config.transport.enableUdp) {
         registerTransport("udp", std::make_shared<UdpTransport>());
     }
+#ifdef EMBEDMQ_ENABLE_TCP
+    if (config.transport.enableTcp) {
+        registerTransport("tcp", std::make_shared<TcpTransport>());
+    }
+#endif
 }
 
 void TransportManager::initAll(const ParticipantConfig& config) {

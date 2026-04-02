@@ -34,6 +34,7 @@ private:
     void acceptLoop();
     void clientLoop(SockFd clientFd, const Endpoint& peerEp);
     SockFd getOrConnect(const Endpoint& ep);
+    bool sendAll(SockFd fd, const uint8_t* data, size_t size);
 
     SockFd                                           listenFd_{INVALID_SOCK};
     uint16_t                                         localPort_{0};

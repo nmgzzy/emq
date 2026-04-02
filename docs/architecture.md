@@ -1883,16 +1883,18 @@ embedmq/
 │       ├── device_a.cpp
 │       └── device_b.cpp
 │
-├── tests/
-│   ├── test_topic_router.cpp
-│   ├── test_qos_engine.cpp
-│   ├── test_message_codec.cpp
+├── tests/                               # 统一可执行文件 emq_tests
+│   ├── test_framework.h                 # 轻量框架（模块注册 + 命令行过滤）
+│   ├── test_main.cpp                    # 统一入口（支持 --list / --help / 模块过滤）
+│   ├── test_topic_router.cpp            # 模块: topic_router
+│   ├── test_qos_engine.cpp              # 模块: qos_engine
+│   ├── test_message_codec.cpp           # 模块: message_codec
+│   ├── test_pub_sub.cpp                 # 模块: pub_sub
+│   ├── test_req_rep.cpp                 # 模块: req_rep
+│   ├── test_pal.cpp                     # 模块: pal (进程工具/CRC32/环形缓冲/定时器)
 │   ├── test_discovery.cpp
-│   ├── test_pub_sub.cpp
-│   ├── test_req_rep.cpp
 │   ├── test_transport_udp.cpp
 │   ├── test_transport_local_ipc.cpp
-│   ├── test_platform_pal.cpp         # PAL 层单元测试
 │   └── benchmark/
 │       ├── bench_latency.cpp
 │       └── bench_throughput.cpp
@@ -3618,18 +3620,20 @@ participant->registerSerializer(std::make_shared<MsgPackSerializer>());
 - [x] 遗嘱消息 (Last Will，`ParticipantConfig::lastWill` 配置，FAREWELL 消息)
 - [x] 心跳与超时检测 (`src/discovery/peer_registry.h`，可配置超时时间)
 - [x] TCP Transport（跨平台，`src/transport/tcp_transport.cpp`，长度前缀帧化）
-- [x] 单元测试覆盖（6个测试套件，81 assertions 全部通过）
+- [x] 单元测试覆盖（统一可执行文件 `emq_tests`，6 个模块，101 assertions 全部通过）
 
 **测试统计（Windows MSVC 2022）：**
 
-| 测试套件 | 测试数 | 断言数 | 状态 |
-|---------|--------|--------|------|
-| test_topic_router | 9 | 20 | ✅ PASS |
-| test_message_codec | 8 | 23 | ✅ PASS |
-| test_qos_engine | 5 | 14 | ✅ PASS |
-| test_pal | 11 | 24 | ✅ PASS |
-| test_pub_sub | 5 | 10 | ✅ PASS |
-| test_req_rep | 3 | 10 | ✅ PASS |
+> 运行：`xmake run emq_tests`（全部） / `xmake run emq_tests <module>`（按模块） / `xmake run emq_tests --list`（列出模块）
+
+| 模块 (module) | 测试数 | 断言数 | 状态 |
+|--------------|--------|--------|------|
+| topic_router | 9 | 20 | ✅ PASS |
+| message_codec | 8 | 23 | ✅ PASS |
+| qos_engine | 5 | 14 | ✅ PASS |
+| pal | 11 | 24 | ✅ PASS |
+| pub_sub | 5 | 10 | ✅ PASS |
+| req_rep | 3 | 10 | ✅ PASS |
 | **合计** | **41** | **101** | **✅ 全部通过** |
 
 ### Phase 3 — 性能优化 (v0.3, 5 周)

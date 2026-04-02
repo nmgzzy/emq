@@ -24,9 +24,12 @@ public:
     void setOnLost(PeerLostCb cb)             { onLost_       = std::move(cb); }
 
     void addOrUpdate(const PeerInfo& peer) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        bool isNew = (records_.find(peer.id) == records_.end());
-        records_[peer.id] = {peer, std::chrono::steady_clock::now(), true};
+        bool isNew = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            isNew = (records_.find(peer.id) == records_.end());
+            records_[peer.id] = {peer, std::chrono::steady_clock::now(), true};
+        }
         if (isNew && onDiscovered_) onDiscovered_(peer);
     }
 
