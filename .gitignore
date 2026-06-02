@@ -5,4 +5,8 @@ build/
 # MacOS Cache
 .DS_Store
 
+# python
+__pycache__/
+*.pyc
+
 

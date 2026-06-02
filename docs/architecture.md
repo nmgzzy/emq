@@ -3680,13 +3680,17 @@ participant->registerSerializer(std::make_shared<MsgPackSerializer>());
 - [ ] 流量控制
 - [ ] 交叉编译验证 (ARM Linux / Windows ARM64)
 
-### Phase 5 — 跨语言与工具 (v0.5, 4 周)
+### Phase 5 — 跨语言与工具 (v0.5) ✅ 已完成
 
-- [ ] C ABI 封装
-- [ ] Python 绑定 (ctypes，支持三平台动态库加载)
-- [ ] 命令行监控工具 (emq_monitor)
+- [x] C ABI 封装（`include/embedmq/embedmq_c.h` + `src/capi/embedmq_c.cpp`，
+  不透明句柄 + 异常隔离 + 返回码错误模型；共享库目标 `embedmq_c`）
+- [x] Python 绑定 (ctypes，三平台动态库自动定位；`bindings/python/embedmq.py`)
+- [x] 命令行监控工具（`emqtop`，`tools/emqtop/main.cpp`；monitor/sub/pub/req/echo/peers）
 - [ ] 配置文件支持 (YAML)
 - [ ] 网络桥接工具
+
+> 实现说明：实际落地的文件/目标名与早期设计草案（`src/c_api/c_api.cpp`、`emq_monitor`）
+> 略有差异，以本节与仓库实际为准：C ABI 实现位于 `src/capi/`，CLI 工具名为 `emqtop`。
 
 ### Phase 6 — 生产就绪 (v1.0, 4 周)
 

@@ -19,6 +19,9 @@ option("profile",        { default = "full", values = {"full", "embedded"},
 option("build_tests",    { default = true,  description = "Build unit tests" })
 option("build_examples", { default = true,  description = "Build examples" })
 option("build_bench",    { default = true,  description = "Build performance benchmarks (Phase 3)" })
+-- Phase 5：C ABI 共享库（供 Python/FFI）与命令行监控工具
+option("build_capi",     { default = true,  description = "Build C ABI shared library (Phase 5)" })
+option("build_tools",    { default = true,  description = "Build CLI monitoring tools, e.g. emqtop (Phase 5)" })
 -- TCP 默认关闭：嵌入式以 UDP/SHM 为主，按需显式开启 --enable_tcp=y
 option("enable_tcp",     { default = false, description = "Enable TCP transport (Phase 2)" })
 option("enable_shm",     { default = true,  description = "Enable shared-memory transport (Phase 3)" })
@@ -31,6 +34,9 @@ local want_shm     = has_config("enable_shm")
 local want_iouring = has_config("enable_io_uring") and not embedded
 local want_bench   = has_config("build_bench")    and not embedded
 local want_examples= has_config("build_examples") and not embedded
+-- C ABI / CLI 工具：嵌入式画像默认不构建（按需 --build_capi=y / --build_tools=y）
+local want_capi    = has_config("build_capi")     and not embedded
+local want_tools   = has_config("build_tools")    and not embedded
 if embedded then
     add_defines("EMBEDMQ_EMBEDDED_PROFILE")
 end
@@ -72,6 +78,10 @@ target("embedmq")
     set_kind("static")
     add_includedirs("include", { public = true })
     add_includedirs("src")
+    -- 以 PIC 编译，便于被 C ABI 共享库（embedmq_c）静态链接
+    if not is_plat("windows") then
+        add_cxflags("-fPIC")
+    end
 
     -- core
     add_files("src/core/participant.cpp")
@@ -129,6 +139,10 @@ if has_config("build_tests") then
         add_files("tests/test_phase3.cpp")
         add_files("tests/test_review_fixes.cpp")
         add_files("tests/test_refactor_v2.cpp")
+        -- Phase 5：C ABI 测试，直接把包装层源码编入测试可执行文件
+        add_defines("EMBEDMQ_C_EXPORTS")
+        add_files("tests/test_capi.cpp")
+        add_files("src/capi/embedmq_c.cpp")
         if is_plat("linux") then
             add_syslinks("pthread", "rt")
         elseif is_plat("macosx") then
@@ -168,6 +182,40 @@ if want_examples then
             add_syslinks("ws2_32", "mswsock", "advapi32")
         end
         set_group("examples")
+end
+
+-- ---- C ABI 共享库（Phase 5：供 Python ctypes / 其他 FFI 调用）----
+if want_capi then
+    target("embedmq_c")
+        set_kind("shared")
+        add_deps("embedmq")
+        add_includedirs("include", "src")
+        add_defines("EMBEDMQ_C_EXPORTS")
+        add_files("src/capi/embedmq_c.cpp")
+        if is_plat("linux") then
+            add_syslinks("pthread", "rt")
+        elseif is_plat("macosx") then
+            add_syslinks("pthread")
+        elseif is_plat("windows") then
+            add_syslinks("ws2_32", "mswsock", "advapi32")
+        end
+end
+
+-- ---- CLI 监控工具（Phase 5：emqtop）----
+if want_tools then
+    target("emqtop")
+        set_kind("binary")
+        add_deps("embedmq")
+        add_includedirs("include", "src")
+        add_files("tools/emqtop/main.cpp")
+        if is_plat("linux") then
+            add_syslinks("pthread", "rt")
+        elseif is_plat("macosx") then
+            add_syslinks("pthread")
+        elseif is_plat("windows") then
+            add_syslinks("ws2_32", "mswsock", "advapi32")
+        end
+        set_group("tools")
 end
 
 -- ---- 性能基准测试 ----

@@ -5,8 +5,8 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)]()
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)]()
 [![Build](https://img.shields.io/badge/build-xmake-green)]()
-[![Phase](https://img.shields.io/badge/phase-3%20done-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-2220%20passed-brightgreen)]()
+[![Phase](https://img.shields.io/badge/phase-5%20done-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-2277%20passed-brightgreen)]()
 
 ---
 
@@ -28,6 +28,8 @@ EmbedMQ 是一个**去中心化、插件化传输层、支持发布-订阅与请
 | 跨平台 PAL | 通过平台抽象层统一 Windows / Linux / macOS 差异 |
 | 零第三方依赖 | 仅 C++17 标准库 + 平台原生 API（io_uring 为可选实验特性）|
 | 简洁 API | 16 个核心调用，5 分钟上手 |
+| 多语言接入 | 稳定 C ABI + Python 绑定（ctypes，零依赖）|
+| 命令行工具 | `emqtop` 监控/收发/诊断（类 `mosquitto_pub/sub`）|
 
 ---
 
@@ -70,12 +72,13 @@ xmake run example_req_rep
 ### 运行单元测试
 
 ```bash
-# 运行全部测试（10 个模块，2220 个断言）
+# 运行全部测试（11 个模块，2277 个断言）
 xmake run emq_tests
 
 # 运行指定模块
 xmake run emq_tests pal
 xmake run emq_tests pub_sub req_rep
+xmake run emq_tests capi
 
 # 列出所有可用模块
 xmake run emq_tests --list
@@ -225,7 +228,8 @@ p->onPeerEvent([](uint16_t id, const std::string& name, bool connected) {
 ```
 embedmq/
 ├── include/embedmq/              # 公共 API（仅需包含此目录）
-│   ├── embedmq.h                 # 主头文件（唯一入口）
+│   ├── embedmq.h                 # C++ 主头文件（唯一入口）
+│   ├── embedmq_c.h               # C ABI 头文件（Phase 5：跨语言/FFI 稳定接口）
 │   ├── platform.h                # 平台检测宏
 │   ├── types.h                   # Payload / ReceivedMessage
 │   ├── qos.h                     # QoSProfile
@@ -233,6 +237,9 @@ embedmq/
 │   └── transport/itransport.h    # Transport 插件接口
 │
 ├── src/
+│   ├── capi/                     # C ABI 包装层（Phase 5）
+│   │   └── embedmq_c.cpp         # 不透明句柄封装 + 异常隔离
+│   │
 │   ├── platform/                 # 平台抽象层 (PAL)
 │   │   ├── event_loop.h          # 接口
 │   │   ├── event_loop_epoll.cpp  # Linux
@@ -278,11 +285,20 @@ embedmq/
 │   ├── test_req_rep.cpp          # 模块: req_rep
 │   ├── test_last_will.cpp        # 模块: last_will（遗嘱消息）
 │   ├── test_phase3.cpp           # 模块: phase3（内存池/MPSC/SHM/亲和性/零拷贝）
-│   └── test_review_fixes.cpp     # 模块: review_fixes（审查修复回归）
+│   ├── test_review_fixes.cpp     # 模块: review_fixes（审查修复回归）
+│   └── test_capi.cpp             # 模块: capi（C ABI 句柄/收发/错误码）
 │
 ├── examples/
 │   ├── pub_sub/main.cpp          # 传感器数据发布订阅
 │   └── req_rep/main.cpp          # 计算服务请求响应
+│
+├── bindings/                     # 语言绑定（Phase 5）
+│   └── python/
+│       ├── embedmq.py            # Python ctypes 绑定（零依赖）
+│       └── example.py            # Python 自测 / 示例
+│
+├── tools/                        # 命令行工具（Phase 5）
+│   └── emqtop/main.cpp           # 监控/收发/诊断 CLI（emqtop）
 │
 ├── bench/
 │   └── bench_main.cpp            # 性能基准（emq_bench）
@@ -399,6 +415,75 @@ cfg.threading.cpuAffinity = 2;   // 将内部工作线程绑定到 2 号核心
 
 ---
 
+## 多语言与工具（Phase 5）
+
+### C ABI（跨语言稳定接口）
+
+`include/embedmq/embedmq_c.h` 提供一套纯 C 的扁平接口，对 C++ 核心库做不透明句柄封装：
+所有错误以返回码 / NULL 暴露，C++ 异常绝不跨越 ABI 边界，便于其他语言通过 FFI 调用。
+
+```c
+#include "embedmq/embedmq_c.h"
+
+static void on_msg(const emq_message* m, void* ud) {
+    printf("%s: %.*s\n", m->topic, (int)m->payload_len, m->payload);
+}
+
+int main(void) {
+    emq_participant* p   = emq_participant_create("c_node");
+    emq_subscriber*  sub = emq_subscriber_create(p, "sensor/#",
+                                                 EMQ_QOS_BEST_EFFORT, on_msg, NULL);
+    emq_publisher*   pub = emq_publisher_create(p, "sensor/temp", EMQ_QOS_BEST_EFFORT);
+    emq_publisher_publish_str(pub, "25.6");
+    /* ... */
+    emq_publisher_destroy(pub);
+    emq_subscriber_destroy(sub);
+    emq_participant_destroy(p);
+    return 0;
+}
+```
+
+构建产物：共享库 `libembedmq_c.so` / `.dylib` / `embedmq_c.dll`（`xmake build embedmq_c`）。
+
+### Python 绑定
+
+基于 ctypes 封装 C ABI，**零第三方依赖**，提供 Pythonic 接口：
+
+```python
+import embedmq
+
+with embedmq.Participant("py_node") as p:
+    sub = p.create_subscriber("sensor/#", lambda m: print(m.topic, m.text))
+    pub = p.create_publisher("sensor/temp")
+    pub.publish("25.6")
+
+    # 请求-响应
+    rep = p.create_replier("multiply",
+        lambda m: str(eval(m.text.replace(" ", "*"))))
+    req = p.create_requester("multiply")
+    print(req.request("6 7"))   # b'42'
+```
+
+运行自测：先 `xmake build embedmq_c`，再 `python3 bindings/python/example.py`。
+库定位顺序：环境变量 `EMBEDMQ_LIB` → 仓库 `build/` 目录扫描 → 系统库路径。
+
+### emqtop —— 命令行监控/诊断工具
+
+类似 `mosquitto_pub/sub` 的网络瑞士军刀，作为普通节点加入网络：
+
+```bash
+emqtop monitor [topic]              # 订阅(默认 #)，实时打印消息 + 拓扑速率统计
+emqtop sub <topic>                  # 仅订阅并打印
+emqtop pub <topic> <msg> [-n N] [-i ms]   # 发布(可重复 N 次、间隔 i 毫秒)
+emqtop req <service> <msg> [-t ms]  # 发送请求并打印响应
+emqtop echo <service>               # 注册回显服务(便于测试 req)
+emqtop peers                        # 列出已发现对端
+
+# 通用选项：--name <n>  --domain <d>  --no-udp  --shm
+```
+
+---
+
 ## 自定义 Transport 插件
 
 实现 `ITransport` 接口即可接入任意传输通道：
@@ -464,7 +549,7 @@ participant->registerTransport("can",
 | Phase 2 | v0.2 | ✅ **已完成** | QoS 1/2、通配符、保留消息、遗嘱消息、心跳、TCP（实验性）|
 | Phase 3 | v0.3 | ✅ **已完成** | 共享内存 Transport、零拷贝 scatter/gather、内存池、无锁 MPSC 队列、CPU 亲和性、io_uring（实验性）、性能基准 |
 | Phase 4 | v0.4 | 📋 规划中 | 串口 Transport、BLE Transport、大消息分片 |
-| Phase 5 | v0.5 | 📋 规划中 | C ABI、Python 绑定、命令行监控工具 |
+| Phase 5 | v0.5 | ✅ **已完成** | C ABI（稳定跨语言接口）、Python 绑定（ctypes，零依赖）、命令行监控工具 `emqtop` |
 | Phase 6 | v1.0 | 📋 规划中 | TLS 加密、LZ4 压缩、CI/CD、正式发布 |
 
 ---
@@ -486,6 +571,10 @@ xmake f --build_tests=n
 xmake f --build_examples=n
 xmake f --build_bench=n
 
+# 禁用 C ABI 共享库 / CLI 工具（Phase 5；embedded 画像下默认不构建）
+xmake f --build_capi=n
+xmake f --build_tools=n
+
 # Release 模式
 xmake f -m release
 
@@ -497,7 +586,7 @@ xmake run emq_bench
 
 ## 测试覆盖
 
-> **平台：** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **总计：2220 assertions / 72 tests，全部通过**
+> **平台：** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **总计：2277 assertions / 81 tests，全部通过**
 
 | 测试套件 | 覆盖内容 | 断言数 |
 |---------|---------|--------|
@@ -511,6 +600,7 @@ xmake run emq_bench
 | `test_phase3` | 内存池、无锁 MPSC、CPU 亲和性、共享内存收发、零拷贝编码 | 49 |
 | `test_review_fixes` | 编解码加固、时间轮长定时器/取消、对端更新、无服务请求不挂起 | 15 |
 | `test_refactor_v2` | Payload SBO、协议 v2 小端/紧凑头/可选 CRC、QoS2 滑动窗口与握手 | ~2040 |
+| `test_capi` | C ABI 句柄生命周期、Pub/Sub 与 Req/Rep 往返、二进制载荷、超时、NULL 健壮性 | 55 |
 
 ---
 
@@ -528,4 +618,4 @@ MIT License — 详见 [LICENSE](LICENSE) 文件。
 
 ---
 
-*EmbedMQ v0.4.0 — Phase 1 + Phase 2 + Phase 3 已实现；协议 v2（紧凑头/显式小端/可选 CRC）、QoS2 完整状态机、TLV 发现、嵌入式构建 profile 已落地*
+*EmbedMQ v0.4.0 — Phase 1 + Phase 2 + Phase 3 + Phase 5 已实现；协议 v2（紧凑头/显式小端/可选 CRC）、QoS2 完整状态机、TLV 发现、嵌入式构建 profile，以及 C ABI / Python 绑定 / `emqtop` CLI 已落地*
