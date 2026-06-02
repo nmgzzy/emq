@@ -104,6 +104,22 @@ bool UdpTransport::send(const Endpoint& to, const uint8_t* data, size_t size) {
     return n == static_cast<int>(size);
 }
 
+bool UdpTransport::sendv(const Endpoint& to, const IoSlice* slices, size_t count) {
+    if (!active_ || unicastFd_ == INVALID_SOCK) return false;
+    // 转换为平台层 IoSlice 并通过 sendmsg/WSASendTo 零拷贝发送
+    std::vector<platform::IoSlice> pslices(count);
+    size_t total = 0;
+    for (size_t i = 0; i < count; ++i) {
+        pslices[i].data = slices[i].data;
+        pslices[i].len  = slices[i].len;
+        total += slices[i].len;
+    }
+    int n = platform::SocketApi::sendToV(unicastFd_, pslices.data(),
+                                          static_cast<int>(count),
+                                          to.address, to.port);
+    return n == static_cast<int>(total);
+}
+
 bool UdpTransport::broadcast(const uint8_t* data, size_t size) {
     if (!active_ || unicastFd_ == INVALID_SOCK) return false;
     int n = platform::SocketApi::sendTo(unicastFd_, data, static_cast<int>(size),

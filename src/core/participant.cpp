@@ -53,6 +53,12 @@ void Participant::Impl::init() {
         if (peerEventCb) peerEventCb(peerId, peerName, false);
     });
 
+    // 对端异常掉线（超时）时，代为发布其遗嘱消息到本地订阅者
+    discovery->setOnPeerWill([this](const PeerInfo& peer) {
+        messageBus->deliverWill(peer.willTopic, peer.willPayload,
+                                peer.willRetain, peer.id);
+    });
+
     // 将传输层接收数据按消息类型分发给 DiscoveryAgent 或 MessageBus
     transportMgr->setRecvCallback([this](const Endpoint& from,
                                           const uint8_t* data, size_t size) {
@@ -71,7 +77,7 @@ void Participant::Impl::init() {
     });
 
     discovery->start();
-    messageBus->start();
+    messageBus->start(config.threading.pinCpu ? config.threading.cpuAffinity : -1);
     running = true;
 
     EMQ_LOG_I("Participant", "Started: %s (id=%u)", name.c_str(), id);

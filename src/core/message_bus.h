@@ -23,6 +23,13 @@ struct PeerInfo {
     std::vector<Endpoint> endpoints;
     std::vector<std::string> publishedTopics;
     std::vector<std::string> subscribedTopics;
+
+    // 遗嘱消息（Last Will）：节点异常掉线时由发现该掉线的对端代为发布
+    bool        hasWill{false};
+    std::string willTopic;
+    Payload     willPayload;
+    bool        willRetain{false};
+    uint8_t     willQos{0};
 };
 
 /// 消息总线 —— 中间件核心
@@ -31,7 +38,7 @@ public:
     explicit MessageBus(uint16_t nodeId, TransportManager* tm);
     ~MessageBus();
 
-    void start();
+    void start(int cpuAffinity = -1);
     void stop();
 
     // ---- Pub/Sub ----
@@ -54,6 +61,11 @@ public:
     // ---- Discovery 回调 ----
     void onPeerDiscovered(const PeerInfo& peer);
     void onPeerLost(uint16_t peerId);
+
+    // ---- 遗嘱消息：由 DiscoveryAgent 在检测到对端异常掉线时调用 ----
+    // 将掉线对端的遗嘱消息投递到本地订阅者（并按需存为保留消息）
+    void deliverWill(const std::string& topic, const Payload& payload,
+                     bool retain, uint16_t sourceId);
 
     // ---- 内部：传输层收到数据时调用 ----
     void onReceived(const Endpoint& from, const uint8_t* data, size_t size);

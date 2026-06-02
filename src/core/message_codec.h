@@ -85,6 +85,54 @@ public:
         return buffer;
     }
 
+    /// 零拷贝编码：仅生成 40 字节固定头，topic 与 payload 不再拷贝进同一缓冲区，
+    /// 由调用方以 scatter/gather（sendToV）方式分片发送：{header, topic, payload}。
+    /// checksum 覆盖 header(checksum 字段置零) + topic + payload，与 decode() 完全兼容。
+    static std::vector<uint8_t> encodeHeader(
+        MessageType type,
+        uint16_t sourceId,
+        uint16_t destId,
+        const std::string& topic,
+        const Payload& payload,
+        const QoSProfile& qos,
+        uint32_t sequenceId,
+        uint32_t correlationId = 0,
+        uint8_t  flags         = 0,
+        uint8_t  serializerId  = 0)
+    {
+        WireHeader header{};
+        header.magic         = EMBEDMQ_MAGIC;
+        header.version       = EMBEDMQ_VERSION;
+        header.msgType       = static_cast<uint8_t>(type);
+        header.qosLevel      = static_cast<uint8_t>(qos.level);
+        header.flags         = flags;
+        header.sourceId      = sourceId;
+        header.destId        = destId;
+        header.topicLen      = static_cast<uint16_t>(topic.size());
+        header.sequenceId    = sequenceId;
+        header.correlationId = correlationId;
+        header.timestamp     = currentTimestampNs();
+        header.serializerId  = serializerId;
+        header.payloadLen    = static_cast<uint32_t>(payload.size());
+        header.checksum      = 0;
+
+        std::vector<uint8_t> buffer(HEADER_FIXED_SIZE);
+        std::memcpy(buffer.data(), &header, HEADER_FIXED_SIZE);
+
+        // CRC 覆盖 header[4..40)（checksum 字段已为 0）+ topic + payload
+        uint32_t state = 0xFFFFFFFFu;
+        state = util::crc32_update(state, buffer.data() + 4, HEADER_FIXED_SIZE - 4);
+        if (!topic.empty())
+            state = util::crc32_update(state,
+                        reinterpret_cast<const uint8_t*>(topic.data()), topic.size());
+        if (payload.size() > 0)
+            state = util::crc32_update(state, payload.data(), payload.size());
+        uint32_t crc = ~state;
+
+        reinterpret_cast<WireHeader*>(buffer.data())->checksum = crc;
+        return buffer;
+    }
+
     struct DecodeResult {
         bool       valid{false};
         WireHeader header{};

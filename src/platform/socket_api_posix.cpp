@@ -5,6 +5,8 @@
 
 #include <cstring>
 #include <errno.h>
+#include <vector>
+#include <sys/uio.h>
 
 namespace embedmq {
 namespace platform {
@@ -150,6 +152,35 @@ int SocketApi::recvFrom(SockFd sock, void* buf, int bufLen,
 
 int SocketApi::send(SockFd sock, const void* data, int len) {
     return static_cast<int>(::send(sock, data, len, 0));
+}
+
+int SocketApi::sendToV(SockFd sock, const IoSlice* slices, int count,
+                       const std::string& ip, uint16_t port) {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    ::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+    addr.sin_port = htons(port);
+
+    std::vector<iovec> iov(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        iov[i].iov_base = const_cast<void*>(slices[i].data);
+        iov[i].iov_len  = slices[i].len;
+    }
+    msghdr msg{};
+    msg.msg_name    = &addr;
+    msg.msg_namelen = sizeof(addr);
+    msg.msg_iov     = iov.data();
+    msg.msg_iovlen  = static_cast<size_t>(count);
+    return static_cast<int>(::sendmsg(sock, &msg, 0));
+}
+
+int SocketApi::sendV(SockFd sock, const IoSlice* slices, int count) {
+    std::vector<iovec> iov(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        iov[i].iov_base = const_cast<void*>(slices[i].data);
+        iov[i].iov_len  = slices[i].len;
+    }
+    return static_cast<int>(::writev(sock, iov.data(), count));
 }
 
 int SocketApi::recv(SockFd sock, void* buf, int bufLen) {

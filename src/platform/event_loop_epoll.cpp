@@ -135,9 +135,12 @@ private:
     std::thread                               thread_;
 };
 
+// 当启用 io_uring（实验性）时，create() 由 event_loop_io_uring.cpp 提供
+#ifndef EMBEDMQ_ENABLE_IO_URING
 std::unique_ptr<EventLoop> EventLoop::create() {
     return std::make_unique<EpollEventLoop>();
 }
+#endif
 
 } // namespace platform
 } // namespace embedmq

@@ -10,6 +10,7 @@
 #include <vector>
 #include <atomic>
 #include <thread>
+#include "../platform/process.h"
 
 // Windows min/max macro workaround
 #ifdef max
@@ -37,9 +38,16 @@ public:
 
     ~TimerWheel() { stop(); }
 
+    /// 设置工作线程的 CPU 亲和性（cpu >= 0 时生效），需在 start() 前调用
+    void setAffinity(int cpu) { affinityCpu_ = cpu; }
+
     void start() {
         running_ = true;
-        thread_  = std::thread([this]() { loop(); });
+        thread_  = std::thread([this]() {
+            if (affinityCpu_ >= 0)
+                platform::setCurrentThreadAffinity(affinityCpu_);
+            loop();
+        });
     }
 
     void stop() {
@@ -115,6 +123,7 @@ private:
     std::atomic<TimerId> nextId_{1};
     std::atomic<bool>  running_{false};
     std::thread        thread_;
+    int                affinityCpu_{-1};
 };
 
 } // namespace util

@@ -19,9 +19,11 @@ class PeerRegistry {
 public:
     using PeerDiscoveredCb = std::function<void(const PeerInfo&)>;
     using PeerLostCb       = std::function<void(uint16_t, const std::string&)>;
+    using PeerWillCb       = std::function<void(const PeerInfo&)>;
 
     void setOnDiscovered(PeerDiscoveredCb cb) { onDiscovered_ = std::move(cb); }
     void setOnLost(PeerLostCb cb)             { onLost_       = std::move(cb); }
+    void setOnWill(PeerWillCb cb)             { onWill_       = std::move(cb); }
 
     void addOrUpdate(const PeerInfo& peer) {
         bool isNew = false;
@@ -33,19 +35,26 @@ public:
         if (isNew && onDiscovered_) onDiscovered_(peer);
     }
 
-    void remove(uint16_t peerId) {
+    /// 移除对端。triggerWill=true 表示异常掉线（超时），需要代为发布其遗嘱；
+    /// triggerWill=false 表示优雅退出（收到 FAREWELL），遗嘱被丢弃。
+    void remove(uint16_t peerId, bool triggerWill = false) {
         std::string name;
+        PeerInfo    info;
+        bool        fireWill = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = records_.find(peerId);
             if (it == records_.end()) return;
-            name = it->second.info.name;
+            info     = it->second.info;
+            name     = info.name;
+            fireWill = triggerWill && info.hasWill;
             records_.erase(it);
         }
+        if (fireWill && onWill_) onWill_(info);
         if (onLost_) onLost_(peerId, name);
     }
 
-    /// 检查超时节点，返回已超时的 peer id 列表
+    /// 检查超时节点，返回已超时的 peer id 列表。超时属于异常掉线，触发遗嘱。
     std::vector<uint16_t> checkTimeouts(uint32_t timeoutMs) {
         std::vector<uint16_t> dead;
         auto now = std::chrono::steady_clock::now();
@@ -59,7 +68,7 @@ public:
                 }
             }
         }
-        for (auto id : dead) remove(id);
+        for (auto id : dead) remove(id, /*triggerWill=*/true);
         return dead;
     }
 
@@ -93,6 +102,7 @@ private:
     std::unordered_map<uint16_t, PeerRecord>   records_;
     PeerDiscoveredCb                           onDiscovered_;
     PeerLostCb                                 onLost_;
+    PeerWillCb                                 onWill_;
 };
 
 } // namespace embedmq

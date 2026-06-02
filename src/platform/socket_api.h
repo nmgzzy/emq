@@ -25,6 +25,12 @@ constexpr SockFd INVALID_SOCK = -1;
 namespace embedmq {
 namespace platform {
 
+/// 零拷贝 scatter/gather 数据片：指向一段连续内存，不拥有所有权
+struct IoSlice {
+    const void* data{nullptr};
+    size_t      len{0};
+};
+
 /// 跨平台 Socket 工具
 class SocketApi {
 public:
@@ -63,6 +69,11 @@ public:
                            std::string& srcIp, uint16_t& srcPort);
     static int    send(SockFd sock, const void* data, int len);
     static int    recv(SockFd sock, void* buf, int bufLen);
+
+    // ---- 零拷贝 scatter/gather 发送（POSIX sendmsg / Windows WSASendTo）----
+    static int    sendToV(SockFd sock, const IoSlice* slices, int count,
+                          const std::string& ip, uint16_t port);
+    static int    sendV(SockFd sock, const IoSlice* slices, int count);
 
     static void   close(SockFd sock);
 

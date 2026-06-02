@@ -22,6 +22,7 @@ public:
 
     bool send(const Endpoint& to, const uint8_t* data, size_t size) override;
     bool broadcast(const uint8_t* data, size_t size)                 override;
+    bool sendv(const Endpoint& to, const IoSlice* slices, size_t count) override;
 
     void setRecvCallback(TransportRecvCallback cb)   override;
     void setEventCallback(TransportEventCallback cb) override;

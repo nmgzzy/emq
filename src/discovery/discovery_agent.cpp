@@ -28,6 +28,9 @@ DiscoveryAgent::DiscoveryAgent(uint16_t nodeId,
     registry_.setOnLost([this](uint16_t id, const std::string& name) {
         if (onPeerLost_) onPeerLost_(id, name);
     });
+    registry_.setOnWill([this](const PeerInfo& p) {
+        if (onPeerWill_) onPeerWill_(p);
+    });
 }
 
 DiscoveryAgent::~DiscoveryAgent() { stop(); }
@@ -40,8 +43,14 @@ void DiscoveryAgent::setOnPeerLost(std::function<void(uint16_t, const std::strin
     onPeerLost_ = std::move(cb);
 }
 
+void DiscoveryAgent::setOnPeerWill(std::function<void(const PeerInfo&)> cb) {
+    onPeerWill_ = std::move(cb);
+}
+
 void DiscoveryAgent::start() {
     running_ = true;
+    if (config_.threading.pinCpu)
+        timerWheel_.setAffinity(config_.threading.cpuAffinity);
     timerWheel_.start();
 
     // 立即发送一次 Announce
@@ -175,6 +184,33 @@ std::vector<uint8_t> DiscoveryAgent::buildAnnouncePayload() const {
         std::memcpy(buf.data() + oldSize, topics[i].c_str(), tlen);
     }
 
+    // ---- 遗嘱消息块（可选，追加在 topics 之后）----
+    const auto& will = config_.lastWill;
+    if (will.enabled && !will.topic.empty()) {
+        buf.push_back(0x01); // willFlag
+        buf.push_back(static_cast<uint8_t>(will.qos));
+        buf.push_back(will.retain ? 1 : 0);
+
+        uint16_t tlen = static_cast<uint16_t>(
+            std::min<size_t>(will.topic.size(), 0xFFFF));
+        uint32_t plen = static_cast<uint32_t>(will.payload.size());
+
+        buf.push_back(static_cast<uint8_t>(tlen & 0xFF));
+        buf.push_back(static_cast<uint8_t>((tlen >> 8) & 0xFF));
+        buf.push_back(static_cast<uint8_t>(plen & 0xFF));
+        buf.push_back(static_cast<uint8_t>((plen >> 8) & 0xFF));
+        buf.push_back(static_cast<uint8_t>((plen >> 16) & 0xFF));
+        buf.push_back(static_cast<uint8_t>((plen >> 24) & 0xFF));
+
+        buf.insert(buf.end(), will.topic.begin(), will.topic.begin() + tlen);
+        if (plen > 0) {
+            const uint8_t* pd = will.payload.data();
+            buf.insert(buf.end(), pd, pd + plen);
+        }
+    } else {
+        buf.push_back(0x00); // willFlag = 无遗嘱
+    }
+
     return buf;
 }
 
@@ -212,6 +248,33 @@ bool DiscoveryAgent::parseAnnouncePayload(const uint8_t* data, size_t size,
         offset += ANNOUNCE_TOPIC_LEN;
         out.subscribedTopics.push_back(topic);
         out.publishedTopics.push_back(topic);
+    }
+
+    // ---- 解析遗嘱消息块（可选）----
+    if (offset < size) {
+        uint8_t willFlag = data[offset++];
+        if (willFlag == 0x01 && offset + 8 <= size) {
+            out.willQos    = data[offset++];
+            out.willRetain = (data[offset++] != 0);
+            uint16_t tlen  = static_cast<uint16_t>(data[offset]) |
+                             (static_cast<uint16_t>(data[offset+1]) << 8);
+            offset += 2;
+            uint32_t plen  = static_cast<uint32_t>(data[offset]) |
+                             (static_cast<uint32_t>(data[offset+1]) << 8) |
+                             (static_cast<uint32_t>(data[offset+2]) << 16) |
+                             (static_cast<uint32_t>(data[offset+3]) << 24);
+            offset += 4;
+            if (offset + tlen + plen <= size) {
+                out.willTopic.assign(
+                    reinterpret_cast<const char*>(data + offset), tlen);
+                offset += tlen;
+                if (plen > 0) {
+                    out.willPayload = Payload(data + offset, plen);
+                    offset += plen;
+                }
+                out.hasWill = true;
+            }
+        }
     }
 
     return true;

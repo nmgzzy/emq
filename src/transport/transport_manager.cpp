@@ -3,6 +3,10 @@
 #ifdef EMBEDMQ_ENABLE_TCP
 #include "tcp_transport.h"
 #endif
+#ifdef EMBEDMQ_ENABLE_SHM
+#include "shm_transport.h"
+#endif
+#include "../platform/process.h"
 #include "../util/logger.h"
 
 namespace embedmq {
@@ -23,14 +27,21 @@ void TransportManager::registerDefaultTransports(const ParticipantConfig& config
         registerTransport("tcp", std::make_shared<TcpTransport>());
     }
 #endif
+#ifdef EMBEDMQ_ENABLE_SHM
+    if (config.transport.enableShm) {
+        registerTransport("shm", std::make_shared<ShmTransport>());
+    }
+#endif
 }
 
 void TransportManager::initAll(const ParticipantConfig& config) {
     std::lock_guard<std::mutex> lock(mutex_);
+    std::string shmName = "emq_shm_" + std::to_string(platform::getProcessId());
     for (auto& [name, transport] : transports_) {
         std::string cfg = "{\"port\":" + std::to_string(config.transport.udpPort) + ","
                         + "\"multicast_group\":\"" + config.discovery.multicastGroup + "\","
-                        + "\"multicast_port\":" + std::to_string(config.discovery.multicastPort) + "}";
+                        + "\"multicast_port\":" + std::to_string(config.discovery.multicastPort) + ","
+                        + "\"shm_name\":\"" + shmName + "\"}";
 
         if (!transport->init(cfg)) {
             EMQ_LOG_E("TransportMgr", "Failed to init transport: %s", name.c_str());
@@ -64,6 +75,19 @@ bool TransportManager::send(const Endpoint& to, const uint8_t* data, size_t size
     auto udp = transports_.find("udp");
     if (udp != transports_.end() && udp->second->isActive()) {
         return udp->second->send(to, data, size);
+    }
+    return false;
+}
+
+bool TransportManager::sendv(const Endpoint& to, const IoSlice* slices, size_t count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = transports_.find(to.transportType);
+    if (it != transports_.end() && it->second->isActive()) {
+        return it->second->sendv(to, slices, count);
+    }
+    auto udp = transports_.find("udp");
+    if (udp != transports_.end() && udp->second->isActive()) {
+        return udp->second->sendv(to, slices, count);
     }
     return false;
 }

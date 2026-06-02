@@ -28,6 +28,7 @@ public:
     void shutdownAll();
 
     bool send(const Endpoint& to, const uint8_t* data, size_t size);
+    bool sendv(const Endpoint& to, const IoSlice* slices, size_t count);
     bool broadcast(const uint8_t* data, size_t size);
 
     void setRecvCallback(GlobalRecvCallback cb);

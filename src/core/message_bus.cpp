@@ -115,8 +115,9 @@ MessageBus::MessageBus(uint16_t nodeId, TransportManager* tm)
 
 MessageBus::~MessageBus() { stop(); }
 
-void MessageBus::start() {
+void MessageBus::start(int cpuAffinity) {
     running_ = true;
+    timerWheel_.setAffinity(cpuAffinity);
     timerWheel_.start();
 
     // 定期处理重传超时
@@ -269,18 +270,31 @@ bool MessageBus::publish(const std::string& topic,
 
     for (auto& ep : targets) {
         uint32_t epSeqId = seqCounter_++;
-        auto data = MessageCodec::encode(
-            MessageType::PUBLISH, nodeId_, 0xFFFF,
-            topic, payload, qos, epSeqId, 0, flags);
-
-        if (transportMgr_) transportMgr_->send(ep, data.data(), data.size());
 
         if (qos.level >= QoSLevel::Reliable) {
+            // 可靠传输：需保留完整缓冲以便重传
+            auto data = MessageCodec::encode(
+                MessageType::PUBLISH, nodeId_, 0xFFFF,
+                topic, payload, qos, epSeqId, 0, flags);
+            if (transportMgr_) transportMgr_->send(ep, data.data(), data.size());
             qosEngine_.addPending(epSeqId, data, qos,
                 [this, ep](const std::vector<uint8_t>& d) {
                     if (transportMgr_)
                         transportMgr_->send(ep, d.data(), d.size());
                 });
+        } else if (transportMgr_) {
+            // BestEffort：零拷贝 scatter/gather 发送 {header, topic, payload}
+            auto header = MessageCodec::encodeHeader(
+                MessageType::PUBLISH, nodeId_, 0xFFFF,
+                topic, payload, qos, epSeqId, 0, flags);
+            IoSlice slices[3];
+            int n = 0;
+            slices[n++] = IoSlice{ header.data(), header.size() };
+            if (!topic.empty())
+                slices[n++] = IoSlice{ topic.data(), topic.size() };
+            if (payload.size() > 0)
+                slices[n++] = IoSlice{ payload.data(), payload.size() };
+            transportMgr_->sendv(ep, slices, static_cast<size_t>(n));
         }
     }
 
@@ -394,6 +408,32 @@ void MessageBus::onPeerLost(uint16_t peerId) {
     std::lock_guard<std::mutex> lock(peerMutex_);
     peers_.erase(peerId);
     EMQ_LOG_I("MessageBus", "Peer lost: id=%u", peerId);
+}
+
+void MessageBus::deliverWill(const std::string& topic, const Payload& payload,
+                              bool retain, uint16_t sourceId)
+{
+    uint32_t seqId = seqCounter_++;
+
+    if (retain) {
+        ReceivedMessage retained;
+        retained.topic      = topic;
+        retained.payload    = payload;
+        retained.timestamp  = 0;
+        retained.sourceId   = sourceId;
+        retained.sequenceId = seqId;
+        retainedStore_.store(topic, retained);
+    }
+
+    ReceivedMessage msg;
+    msg.topic      = topic;
+    msg.payload    = payload;
+    msg.sourceId   = sourceId;
+    msg.sequenceId = seqId;
+    router_.route(topic, msg);
+
+    EMQ_LOG_I("MessageBus", "Last-Will delivered: topic=%s (src=%u)",
+              topic.c_str(), sourceId);
 }
 
 void MessageBus::sendAck(const Endpoint& to, uint32_t seqId) {

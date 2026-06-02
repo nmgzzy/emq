@@ -3611,40 +3611,45 @@ participant->registerSerializer(std::make_shared<MsgPackSerializer>());
 
 ### Phase 2 — 可靠性 (v0.2, ✅ 已完成)
 
-> **完成时间：** 2026-04 | **单元测试：** 81 assertions passed ✅
+> **完成时间：** 2026-06 | **单元测试：** 见下方合计 ✅
 
 - [x] QoS Level 1 (ACK + 重传，`src/core/qos_engine.h`)
 - [x] QoS Level 2 (ExactlyOnce 去重，基于 sourceId+seqId)
 - [x] 通配符主题匹配（`*` 单级 / `#` 多级，`src/core/topic_router.h`）
 - [x] 保留消息 (Retained，`src/core/retained_store.h`，TransientLocal 持久性)
-- [x] 遗嘱消息 (Last Will，`ParticipantConfig::lastWill` 配置，FAREWELL 消息)
+- [x] 遗嘱消息 (Last Will)：遗嘱随 ANNOUNCE 广告给对端；对端**超时**判定异常掉线时
+      代为投递遗嘱（含保留），收到 **FAREWELL** 优雅退出则丢弃遗嘱
+      （`src/discovery/peer_registry.h`、`MessageBus::deliverWill`）
 - [x] 心跳与超时检测 (`src/discovery/peer_registry.h`，可配置超时时间)
 - [x] TCP Transport（跨平台，`src/transport/tcp_transport.cpp`，长度前缀帧化）
-- [x] 单元测试覆盖（统一可执行文件 `emq_tests`，6 个模块，101 assertions 全部通过）
 
-**测试统计（Windows MSVC 2022）：**
+**测试统计（Linux GCC x64 / Windows MSVC 2022）：**
 
 > 运行：`xmake run emq_tests`（全部） / `xmake run emq_tests <module>`（按模块） / `xmake run emq_tests --list`（列出模块）
 
-| 模块 (module) | 测试数 | 断言数 | 状态 |
-|--------------|--------|--------|------|
-| topic_router | 9 | 20 | ✅ PASS |
-| message_codec | 8 | 23 | ✅ PASS |
-| qos_engine | 5 | 14 | ✅ PASS |
-| pal | 11 | 24 | ✅ PASS |
-| pub_sub | 5 | 10 | ✅ PASS |
-| req_rep | 3 | 10 | ✅ PASS |
-| **合计** | **41** | **101** | **✅ 全部通过** |
+| 模块 (module) | 断言数 | 状态 |
+|--------------|--------|------|
+| topic_router | 20 | ✅ PASS |
+| message_codec | 23 | ✅ PASS |
+| qos_engine | 14 | ✅ PASS |
+| pal | 24 | ✅ PASS |
+| pub_sub | 10 | ✅ PASS |
+| req_rep | 10 | ✅ PASS |
+| last_will | 15 | ✅ PASS |
+| phase3 | 49 | ✅ PASS |
+| **合计** | **165** | **✅ 全部通过** |
 
-### Phase 3 — 性能优化 (v0.3, 5 周)
+### Phase 3 — 性能优化 (v0.3, ✅ 已完成)
 
-- [ ] 共享内存 Transport（POSIX shm + Win32 FileMapping）
-- [ ] 零拷贝发送 (scatter/gather: writev/WSASend)
-- [ ] 内存池
-- [ ] 无锁队列优化
-- [ ] io_uring 支持 (Linux 可选)
-- [ ] 性能基准测试（三平台对比）
-- [ ] CPU 亲和性 (Linux/Windows)
+- [x] 共享内存 Transport（POSIX shm_open+mmap / Win32 FileMapping，`src/transport/shm_transport.cpp`）
+      —— 有界 MPSC 槽位环，多生产者 CAS 预留 + 单消费者轮询
+- [x] 零拷贝发送 (scatter/gather: sendmsg/iovec、WSASendTo/WSABUF；`MessageCodec::encodeHeader` + `ITransport::sendv`)
+- [x] 内存池（`src/util/memory_pool.h`，固定块 + 头部标记区分超大回退）
+- [x] 无锁队列优化（`src/util/mpsc_queue.h`，Vyukov MPSC；保留 SPSC 环形缓冲）
+- [x] CPU 亲和性 (Linux pthread_setaffinity_np / Windows SetThreadAffinityMask；`platform::setThreadAffinity`，由 `ParticipantConfig::threading` 驱动)
+- [x] 性能基准测试（`bench/bench_main.cpp`，`emq_bench`：内存池/MPSC/SPSC/CRC32/Pub-Sub）
+- [~] io_uring 支持 (Linux 可选，实验性)：构建选项 `enable_io_uring`，
+      `src/platform/event_loop_io_uring.cpp`（IORING_OP_POLL_ADD），默认关闭，需 liburing
 
 ### Phase 4 — 嵌入式与外设拓展 (v0.4, 6 周)
 
@@ -3713,8 +3718,8 @@ participant->registerSerializer(std::make_shared<MsgPackSerializer>());
 
 ---
 
-*文档版本：v2.1（Phase 1 + Phase 2 实现完成）*
-*最后更新：2026-04*
-*构建状态：Windows (MSVC 2022 x64) ✅ | Linux (GCC/Clang，代码已就绪) | macOS (待验证)*
-*测试状态：101 assertions / 41 tests — 全部通过 ✅*
+*文档版本：v2.2（Phase 1 + Phase 2 + Phase 3 实现完成）*
+*最后更新：2026-06*
+*构建状态：Linux (GCC x64) ✅ | Windows (MSVC 2022 x64) ✅ | macOS (代码已就绪，待验证)*
+*测试状态：165 assertions / 57 tests — 全部通过 ✅*
 *作者：EmbedMQ Design Team*

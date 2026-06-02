@@ -10,6 +10,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <cstring>
+#include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -156,6 +157,37 @@ int SocketApi::send(SockFd sock, const void* data, int len) {
 
 int SocketApi::recv(SockFd sock, void* buf, int bufLen) {
     return ::recv(sock, static_cast<char*>(buf), bufLen, 0);
+}
+
+int SocketApi::sendToV(SockFd sock, const IoSlice* slices, int count,
+                       const std::string& ip, uint16_t port) {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    ::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+    addr.sin_port = htons(port);
+
+    std::vector<WSABUF> bufs(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        bufs[i].buf = reinterpret_cast<CHAR*>(const_cast<void*>(slices[i].data));
+        bufs[i].len = static_cast<ULONG>(slices[i].len);
+    }
+    DWORD sent = 0;
+    int r = ::WSASendTo(sock, bufs.data(), static_cast<DWORD>(count), &sent, 0,
+                        reinterpret_cast<sockaddr*>(&addr), sizeof(addr),
+                        nullptr, nullptr);
+    return r == 0 ? static_cast<int>(sent) : -1;
+}
+
+int SocketApi::sendV(SockFd sock, const IoSlice* slices, int count) {
+    std::vector<WSABUF> bufs(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        bufs[i].buf = reinterpret_cast<CHAR*>(const_cast<void*>(slices[i].data));
+        bufs[i].len = static_cast<ULONG>(slices[i].len);
+    }
+    DWORD sent = 0;
+    int r = ::WSASend(sock, bufs.data(), static_cast<DWORD>(count), &sent, 0,
+                      nullptr, nullptr);
+    return r == 0 ? static_cast<int>(sent) : -1;
 }
 
 void SocketApi::close(SockFd sock) {
