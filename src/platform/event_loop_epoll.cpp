@@ -72,7 +72,7 @@ public:
             int fd = events[i].data.fd;
             if (fd == wakeupFd_) {
                 uint64_t val;
-                ::read(wakeupFd_, &val, sizeof(val));
+                (void)::read(wakeupFd_, &val, sizeof(val));
                 continue;
             }
             IoCallback cb;
@@ -106,7 +106,7 @@ public:
     void wakeup() override {
         if (wakeupFd_ >= 0) {
             uint64_t val = 1;
-            ::write(wakeupFd_, &val, sizeof(val));
+            (void)::write(wakeupFd_, &val, sizeof(val));
         }
     }
 

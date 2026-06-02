@@ -56,10 +56,10 @@ namespace platform {
 using IoHandle = std::intptr_t;
 
 inline IoHandle toIoHandle(NativeHandle h) {
-    return reinterpret_cast<IoHandle>(h);
+    return static_cast<IoHandle>(h);
 }
 inline NativeHandle fromIoHandle(IoHandle h) {
-    return reinterpret_cast<NativeHandle>(h);
+    return static_cast<NativeHandle>(h);
 }
 
 } // namespace platform
