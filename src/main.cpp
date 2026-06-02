@@ -12,9 +12,10 @@
  *           xmake run emq_tests --list        （列出所有模块）
  */
 #include <cstdio>
+#include "embedmq/platform.h"
 
 int main() {
-    std::printf("EmbedMQ v0.2.0 — Phase 1+2 Implemented\n");
+    std::printf("EmbedMQ v%s — Phase 1-3 Implemented\n", EMQ_VERSION_STRING);
     std::printf("Run 'xmake run example_pub_sub' or 'xmake run example_req_rep'\n");
     std::printf("Run 'xmake run emq_tests' to execute all unit tests\n");
     return 0;

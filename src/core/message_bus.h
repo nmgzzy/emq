@@ -6,6 +6,7 @@
 #include "retained_store.h"
 #include "../util/timer_wheel.h"
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -60,6 +61,7 @@ public:
 
     // ---- Discovery 回调 ----
     void onPeerDiscovered(const PeerInfo& peer);
+    void onPeerUpdated(const PeerInfo& peer);
     void onPeerLost(uint16_t peerId);
 
     // ---- 遗嘱消息：由 DiscoveryAgent 在检测到对端异常掉线时调用 ----
@@ -112,9 +114,15 @@ private:
 
     std::atomic<uint32_t> seqCounter_{1};
 
-    // 等待中的 request：correlationId -> promise
+    // 等待中的 request：correlationId -> (promise + 截止时间)
+    // 注意：请求用 correlationId 索引，与发布可靠消息用的 seqId 是不同命名空间，
+    // 二者不可混用（历史 bug）。deadline 用于在无响应时结束 future，避免永久挂起。
+    struct PendingRequest {
+        std::promise<Payload>                 promise;
+        std::chrono::steady_clock::time_point deadline;
+    };
     std::mutex pendingReqMutex_;
-    std::unordered_map<uint32_t, std::promise<Payload>> pendingRequests_;
+    std::unordered_map<uint32_t, PendingRequest> pendingRequests_;
 
     // service handler 注册
     mutable std::mutex serviceMutex_;

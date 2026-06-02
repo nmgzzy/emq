@@ -73,20 +73,26 @@ public:
 
 private:
     struct Timer {
-        TimerId      id;
-        uint32_t     intervalMs; // 0 = one-shot
-        uint32_t     ticksLeft;
+        TimerId       id;
+        uint32_t      intervalMs; // 0 = one-shot
+        uint64_t      fireTick;   // 绝对触发 tick（支持任意长延时，不受单层轮长度限制）
         TimerCallback cb;
     };
 
     TimerId addTimer(uint32_t delayMs, uint32_t intervalMs, TimerCallback cb) {
         TimerId id = nextId_++;
-        uint32_t ticks = std::max(1u, (delayMs + TICK_MS - 1) / TICK_MS);
-
         std::lock_guard<std::mutex> lock(mutex_);
-        uint32_t slot = (currentSlot_ + ticks) % SLOT_COUNT;
-        slots_[slot].push_back({id, intervalMs, ticks, std::move(cb)});
+        addTimerLocked(id, delayMs, intervalMs, std::move(cb));
         return id;
+    }
+
+    // 必须持有 mutex_ 调用
+    void addTimerLocked(TimerId id, uint32_t delayMs, uint32_t intervalMs,
+                        TimerCallback cb) {
+        uint64_t ticks = std::max<uint64_t>(1u, (delayMs + TICK_MS - 1) / TICK_MS);
+        uint64_t fireTick = curTick_ + ticks;
+        uint32_t slot = static_cast<uint32_t>(fireTick % SLOT_COUNT);
+        slots_[slot].push_back({id, intervalMs, fireTick, std::move(cb)});
     }
 
     void loop() {
@@ -99,19 +105,36 @@ private:
     }
 
     void tick() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        currentSlot_ = (currentSlot_ + 1) % SLOT_COUNT;
-        auto timers   = std::move(slots_[currentSlot_]);
-        slots_[currentSlot_].clear();
-        auto cancelled = std::move(cancelSet_);
-        cancelSet_.clear();
-        lock.unlock();
+        std::vector<Timer> due;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            ++curTick_;
+            uint32_t slot = static_cast<uint32_t>(curTick_ % SLOT_COUNT);
 
-        for (auto& t : timers) {
-            if (cancelled.count(t.id)) continue;
+            // 同一 slot 内可能混有需更晚触发的定时器（fireTick 相差 SLOT_COUNT 的倍数），
+            // 仅取出 fireTick <= curTick_ 的，其余保留在槽中等待下一轮。
+            auto& bucket = slots_[slot];
+            for (auto it = bucket.begin(); it != bucket.end(); ) {
+                if (it->fireTick <= curTick_) {
+                    // 已取消的定时器：丢弃并清除 cancel 记录（cancelSet_ 持久保存
+                    // 直到对应定时器被处理，避免“取消未来定时器”被提前清空而失效）
+                    if (cancelSet_.erase(it->id) == 0)
+                        due.push_back(std::move(*it));
+                    it = bucket.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        for (auto& t : due) {
+            // 关停过程中不再触发回调，避免与 shutdown 顺序竞态
+            if (!running_) break;
             t.cb();
-            if (t.intervalMs > 0) {
-                addTimer(t.intervalMs, t.intervalMs, t.cb);
+            if (t.intervalMs > 0 && running_) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!cancelSet_.count(t.id))
+                    addTimerLocked(t.id, t.intervalMs, t.intervalMs, t.cb);
             }
         }
     }
@@ -119,7 +142,7 @@ private:
     std::vector<std::list<Timer>> slots_;
     std::unordered_set<TimerId>   cancelSet_;
     std::mutex         mutex_;
-    uint32_t           currentSlot_{0};
+    uint64_t           curTick_{0};
     std::atomic<TimerId> nextId_{1};
     std::atomic<bool>  running_{false};
     std::thread        thread_;

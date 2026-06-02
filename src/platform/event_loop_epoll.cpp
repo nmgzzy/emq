@@ -6,6 +6,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <cerrno>
 #include <unordered_map>
 #include <mutex>
 #include <thread>
@@ -72,7 +73,10 @@ public:
             int fd = events[i].data.fd;
             if (fd == wakeupFd_) {
                 uint64_t val;
-                (void)::read(wakeupFd_, &val, sizeof(val));
+                ssize_t nread = ::read(wakeupFd_, &val, sizeof(val));
+                if (nread < 0 && errno != EAGAIN) {
+                    // eventfd 非阻塞读；除 EAGAIN 外错误无需中断事件循环
+                }
                 continue;
             }
             IoCallback cb;
@@ -106,7 +110,10 @@ public:
     void wakeup() override {
         if (wakeupFd_ >= 0) {
             uint64_t val = 1;
-            (void)::write(wakeupFd_, &val, sizeof(val));
+            ssize_t nwritten = ::write(wakeupFd_, &val, sizeof(val));
+            if (nwritten < 0 && errno != EAGAIN) {
+                // eventfd 计数达到上限时可能返回 EAGAIN，可安全忽略
+            }
         }
     }
 

@@ -6,6 +6,7 @@
 #include "../util/logger.h"
 #include <chrono>
 #include <functional>
+#include <random>
 
 namespace embedmq {
 
@@ -20,10 +21,18 @@ struct Participant::Impl {
     PeerEventCallback              peerEventCb;
 
     uint16_t generateNodeId() {
+        // 引入 random_device 增强熵，降低多进程/多节点下 16 位 id 碰撞概率；
+        // 规避保留值 0 与广播地址 0xFFFF。
+        std::random_device rd;
+        uint64_t entropy = (static_cast<uint64_t>(rd()) << 32) ^ rd();
         auto pid = platform::getProcessId();
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         std::hash<uint64_t> hasher;
-        return static_cast<uint16_t>(hasher(pid ^ static_cast<uint64_t>(now)) & 0xFFFF);
+        uint16_t id = static_cast<uint16_t>(
+            hasher(entropy ^ pid ^ static_cast<uint64_t>(now)) & 0xFFFF);
+        if (id == 0)      id = 1;
+        if (id == 0xFFFF) id = 0xFFFE;
+        return id;
     }
 
     void init();
@@ -53,6 +62,11 @@ void Participant::Impl::init() {
         if (peerEventCb) peerEventCb(peerId, peerName, false);
     });
 
+    // 已发现对端后续更新订阅/端点时，刷新本地路由表
+    discovery->setOnPeerUpdated([this](const PeerInfo& peer) {
+        messageBus->onPeerUpdated(peer);
+    });
+
     // 对端异常掉线（超时）时，代为发布其遗嘱消息到本地订阅者
     discovery->setOnPeerWill([this](const PeerInfo& peer) {
         messageBus->deliverWill(peer.willTopic, peer.willPayload,
@@ -62,16 +76,22 @@ void Participant::Impl::init() {
     // 将传输层接收数据按消息类型分发给 DiscoveryAgent 或 MessageBus
     transportMgr->setRecvCallback([this](const Endpoint& from,
                                           const uint8_t* data, size_t size) {
-        if (size >= 4) {
-            auto msgType = static_cast<MessageType>(data[3]);
-            if (msgType == MessageType::ANNOUNCE   ||
-                msgType == MessageType::HEARTBEAT  ||
-                msgType == MessageType::FAREWELL   ||
-                msgType == MessageType::DISCOVER_REQ ||
-                msgType == MessageType::DISCOVER_RSP) {
-                discovery->onDiscoveryMessage(from, data, size);
-                return;
-            }
+        // 先校验固定头的 magic/version，过滤无关或损坏报文，
+        // 避免随机 UDP 包因 data[3] 恰为某消息类型而误入发现路径。
+        if (size < HEADER_FIXED_SIZE) return;
+        if (data[0] != static_cast<uint8_t>(EMBEDMQ_MAGIC & 0xFF) ||
+            data[1] != static_cast<uint8_t>((EMBEDMQ_MAGIC >> 8) & 0xFF) ||
+            data[2] != EMBEDMQ_VERSION) {
+            return;
+        }
+        auto msgType = static_cast<MessageType>(data[3]);
+        if (msgType == MessageType::ANNOUNCE   ||
+            msgType == MessageType::HEARTBEAT  ||
+            msgType == MessageType::FAREWELL   ||
+            msgType == MessageType::DISCOVER_REQ ||
+            msgType == MessageType::DISCOVER_RSP) {
+            discovery->onDiscoveryMessage(from, data, size);
+            return;
         }
         messageBus->onReceived(from, data, size);
     });

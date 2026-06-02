@@ -2,6 +2,9 @@
 #include <cstdint>
 #include <string>
 
+// 库版本字符串（单一来源，供 main/示例/日志引用，避免多处硬编码不一致）
+#define EMQ_VERSION_STRING "0.3.0"
+
 // ---- 平台检测 ----
 #if defined(_WIN32) || defined(_WIN64)
     #define EMQ_PLATFORM_WINDOWS 1

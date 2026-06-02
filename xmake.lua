@@ -23,15 +23,16 @@ option("enable_io_uring",{ default = false, description = "Enable io_uring event
 -- ---- 平台 PAL 源码选择 ----
 local pal_sources = {}
 
-if is_os("linux") then
+-- 使用 is_plat（目标平台）而非 is_os（构建主机），保证交叉编译时按目标选择 PAL
+if is_plat("linux") then
     add_defines("EMQ_PLATFORM_LINUX")
     pal_sources = { "src/platform/event_loop_epoll.cpp",
                     "src/platform/socket_api_posix.cpp" }
-elseif is_os("macosx") then
+elseif is_plat("macosx") then
     add_defines("EMQ_PLATFORM_MACOS")
     pal_sources = { "src/platform/event_loop_kqueue.cpp",
                     "src/platform/socket_api_posix.cpp" }
-elseif is_os("windows") then
+elseif is_plat("windows") then
     add_defines("EMQ_PLATFORM_WINDOWS")
     pal_sources = { "src/platform/event_loop_iocp.cpp",
                     "src/platform/socket_api_win.cpp" }
@@ -43,11 +44,11 @@ target("emq")
     add_deps("embedmq")
     add_includedirs("include", "src")
     add_files("src/main.cpp")
-    if is_os("linux") then
+    if is_plat("linux") then
         add_syslinks("pthread", "rt")
-    elseif is_os("macosx") then
+    elseif is_plat("macosx") then
         add_syslinks("pthread")
-    elseif is_os("windows") then
+    elseif is_plat("windows") then
         add_syslinks("ws2_32", "mswsock", "advapi32")
     end
 
@@ -76,7 +77,7 @@ target("embedmq")
         add_files("src/transport/shm_transport.cpp")
     end
     -- io_uring（Linux 可选，实验性）：默认关闭，需内核 5.1+ 与 liburing
-    if has_config("enable_io_uring") and is_os("linux") then
+    if has_config("enable_io_uring") and is_plat("linux") then
         add_defines("EMBEDMQ_ENABLE_IO_URING")
         add_files("src/platform/event_loop_io_uring.cpp")
         add_syslinks("uring")
@@ -88,11 +89,11 @@ target("embedmq")
     end
 
     -- 平台链接库
-    if is_os("linux") then
+    if is_plat("linux") then
         add_syslinks("pthread", "rt")
-    elseif is_os("macosx") then
+    elseif is_plat("macosx") then
         add_syslinks("pthread")
-    elseif is_os("windows") then
+    elseif is_plat("windows") then
         add_syslinks("ws2_32", "mswsock", "advapi32")
     end
 
@@ -111,11 +112,12 @@ if has_config("build_tests") then
         add_files("tests/test_req_rep.cpp")
         add_files("tests/test_last_will.cpp")
         add_files("tests/test_phase3.cpp")
-        if is_os("linux") then
+        add_files("tests/test_review_fixes.cpp")
+        if is_plat("linux") then
             add_syslinks("pthread", "rt")
-        elseif is_os("macosx") then
+        elseif is_plat("macosx") then
             add_syslinks("pthread")
-        elseif is_os("windows") then
+        elseif is_plat("windows") then
             add_syslinks("ws2_32", "mswsock", "advapi32")
         end
         set_group("tests")
@@ -128,11 +130,11 @@ if has_config("build_examples") then
         add_deps("embedmq")
         add_includedirs("include", "src")
         add_files("examples/pub_sub/main.cpp")
-        if is_os("linux") then
+        if is_plat("linux") then
             add_syslinks("pthread", "rt")
-        elseif is_os("macosx") then
+        elseif is_plat("macosx") then
             add_syslinks("pthread")
-        elseif is_os("windows") then
+        elseif is_plat("windows") then
             add_syslinks("ws2_32", "mswsock", "advapi32")
         end
         set_group("examples")
@@ -142,11 +144,11 @@ if has_config("build_examples") then
         add_deps("embedmq")
         add_includedirs("include", "src")
         add_files("examples/req_rep/main.cpp")
-        if is_os("linux") then
+        if is_plat("linux") then
             add_syslinks("pthread", "rt")
-        elseif is_os("macosx") then
+        elseif is_plat("macosx") then
             add_syslinks("pthread")
-        elseif is_os("windows") then
+        elseif is_plat("windows") then
             add_syslinks("ws2_32", "mswsock", "advapi32")
         end
         set_group("examples")
@@ -159,11 +161,11 @@ if has_config("build_bench") then
         add_deps("embedmq")
         add_includedirs("include", "src")
         add_files("bench/bench_main.cpp")
-        if is_os("linux") then
+        if is_plat("linux") then
             add_syslinks("pthread", "rt")
-        elseif is_os("macosx") then
+        elseif is_plat("macosx") then
             add_syslinks("pthread")
-        elseif is_os("windows") then
+        elseif is_plat("windows") then
             add_syslinks("ws2_32", "mswsock", "advapi32")
         end
         set_group("bench")

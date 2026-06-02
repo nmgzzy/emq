@@ -6,7 +6,7 @@
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)]()
 [![Build](https://img.shields.io/badge/build-xmake-green)]()
 [![Phase](https://img.shields.io/badge/phase-3%20done-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-165%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-180%20passed-brightgreen)]()
 
 ---
 
@@ -70,7 +70,7 @@ xmake run example_req_rep
 ### 运行单元测试
 
 ```bash
-# 运行全部测试（8 个模块，165 个断言）
+# 运行全部测试（9 个模块，180 个断言）
 xmake run emq_tests
 
 # 运行指定模块
@@ -277,7 +277,8 @@ embedmq/
 │   ├── test_pub_sub.cpp          # 模块: pub_sub
 │   ├── test_req_rep.cpp          # 模块: req_rep
 │   ├── test_last_will.cpp        # 模块: last_will（遗嘱消息）
-│   └── test_phase3.cpp           # 模块: phase3（内存池/MPSC/SHM/亲和性/零拷贝）
+│   ├── test_phase3.cpp           # 模块: phase3（内存池/MPSC/SHM/亲和性/零拷贝）
+│   └── test_review_fixes.cpp     # 模块: review_fixes（审查修复回归）
 │
 ├── examples/
 │   ├── pub_sub/main.cpp          # 传感器数据发布订阅
@@ -370,6 +371,9 @@ auto p = embedmq::Participant::create(cfg);
 BestEffort（QoS 0）发布路径使用 `encodeHeader` 仅生成 40 字节线缆头，配合 `sendmsg`/`WSASendTo` 的 iovec 分片发送 `{header, topic, payload}`，避免将载荷再拷贝进单一缓冲。
 
 ### 内存池与无锁队列
+
+以下为库内置的**可选工具组件**（已在 `tests`/`bench` 中验证），当前核心收发路径
+默认仍使用 `std::vector`/标准容器，尚未默认接入；可按需在自定义传输/队列中使用：
 
 - `util::FixedBlockPool`：固定块内存池，O(1) 分配/归还，提供确定性延迟，避免碎片。
 - `util::MpscQueue`：无锁多生产者单消费者队列（Vyukov 算法）。
@@ -493,7 +497,7 @@ xmake run emq_bench
 
 ## 测试覆盖
 
-> **平台：** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **总计：165 assertions，全部通过**
+> **平台：** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **总计：180 assertions，全部通过**
 
 | 测试套件 | 覆盖内容 | 断言数 |
 |---------|---------|--------|
@@ -505,6 +509,7 @@ xmake run emq_bench
 | `test_req_rep` | 同步/异步请求、多请求、请求计数 | 10 |
 | `test_last_will` | 超时触发遗嘱、优雅退出丢弃、本地投递、保留遗嘱 | 15 |
 | `test_phase3` | 内存池、无锁 MPSC、CPU 亲和性、共享内存收发、零拷贝编码 | 49 |
+| `test_review_fixes` | 编解码加固、时间轮长定时器/取消、对端更新、无服务请求不挂起 | 15 |
 
 ---
 

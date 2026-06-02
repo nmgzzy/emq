@@ -68,6 +68,24 @@ bool TcpTransport::sendAll(SockFd fd, const uint8_t* data, size_t size) {
     return true;
 }
 
+// TCP 是字节流，单次 recv 可能返回不足请求的字节数，必须循环读满。
+bool TcpTransport::recvAll(SockFd fd, uint8_t* buf, size_t size) {
+    size_t got = 0;
+    while (got < size) {
+        int r = platform::SocketApi::recv(fd, buf + got,
+                                          static_cast<int>(size - got));
+        if (r <= 0) return false;
+        got += static_cast<size_t>(r);
+    }
+    return true;
+}
+
+void TcpTransport::removeConnection(const Endpoint& ep) {
+    std::string key = ep.address + ":" + std::to_string(ep.port);
+    std::lock_guard<std::mutex> lock(mutex_);
+    connections_.erase(key);
+}
+
 bool TcpTransport::send(const Endpoint& to, const uint8_t* data, size_t size) {
     if (!active_) return false;
     SockFd fd = getOrConnect(to);
@@ -135,8 +153,8 @@ void TcpTransport::clientLoop(SockFd clientFd, const Endpoint& peerEp) {
 
     while (active_) {
         uint8_t lenBuf[4];
-        int n = platform::SocketApi::recv(clientFd, lenBuf, 4);
-        if (n != 4) break;
+        // 长度前缀可能被拆包，必须读满 4 字节
+        if (!recvAll(clientFd, lenBuf, 4)) break;
 
         uint32_t msgLen = (static_cast<uint32_t>(lenBuf[0]) << 24) |
                           (static_cast<uint32_t>(lenBuf[1]) << 16) |
@@ -146,26 +164,19 @@ void TcpTransport::clientLoop(SockFd clientFd, const Endpoint& peerEp) {
         if (msgLen == 0 || msgLen > 10 * 1024 * 1024) break;
 
         buf.resize(msgLen);
-        size_t received = 0;
-        while (received < msgLen) {
-            int r = platform::SocketApi::recv(clientFd,
-                        buf.data() + received,
-                        static_cast<int>(msgLen - received));
-            if (r <= 0) goto done;
-            received += r;
-        }
+        if (!recvAll(clientFd, buf.data(), msgLen)) break;
 
+        TransportRecvCallback cb;
         {
-            TransportRecvCallback cb;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                cb = recvCb_;
-            }
-            if (cb) cb(peerEp, buf.data(), msgLen);
+            std::lock_guard<std::mutex> lock(mutex_);
+            cb = recvCb_;
         }
+        if (cb) cb(peerEp, buf.data(), msgLen);
     }
-done:
+
+    // 连接结束：关闭并从连接表移除，避免后续复用已失效的 fd
     platform::SocketApi::close(clientFd);
+    removeConnection(peerEp);
 }
 
 SockFd TcpTransport::getOrConnect(const Endpoint& ep) {

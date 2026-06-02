@@ -35,12 +35,17 @@ const std::string& Publisher::topic()           const { return impl_->topic; }
 // ===================== Subscriber::Impl =====================
 
 struct Subscriber::Impl {
+    // 共享状态：被路由回调以 weak_ptr 持有，使得 Subscriber 析构后仍在执行的
+    // 在途回调不会访问已释放对象（避免 UAF）。
+    struct State {
+        std::atomic<uint64_t> msgCount{0};
+        std::atomic<bool>     paused{false};
+    };
     std::string      topic;
     QoSProfile       qos;
     uint64_t         subId{0};
     MessageBus*      bus{nullptr};
-    std::atomic<uint64_t> msgCount{0};
-    std::atomic<bool>     paused{false};
+    std::shared_ptr<State> state{std::make_shared<State>()};
 };
 
 Subscriber::Subscriber(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -50,9 +55,9 @@ Subscriber::~Subscriber() {
     }
 }
 const std::string& Subscriber::topic()        const { return impl_->topic; }
-void               Subscriber::pause()              { impl_->paused = true; }
-void               Subscriber::resume()             { impl_->paused = false; }
-uint64_t           Subscriber::messageCount() const { return impl_->msgCount.load(); }
+void               Subscriber::pause()              { impl_->state->paused = true; }
+void               Subscriber::resume()             { impl_->state->paused = false; }
+uint64_t           Subscriber::messageCount() const { return impl_->state->msgCount.load(); }
 
 
 // ===================== Requester::Impl =====================
@@ -73,7 +78,9 @@ std::optional<Payload> Requester::request(
 {
     auto fut = requestAsync(payload);
     if (fut.wait_for(timeout) == std::future_status::ready) {
-        return fut.get();
+        // future 可能携带异常（无服务提供方 / 请求超时），同步接口统一返回 nullopt
+        try { return fut.get(); }
+        catch (...) { return std::nullopt; }
     }
     if (impl_->lastCorrId != 0) {
         impl_->bus->cancelPendingRequest(impl_->lastCorrId);
@@ -91,10 +98,13 @@ std::future<Payload> Requester::requestAsync(const Payload& payload) {
 // ===================== Replier::Impl =====================
 
 struct Replier::Impl {
+    struct State {
+        std::atomic<uint64_t> reqCount{0};
+    };
     std::string    service;
     QoSProfile     qos;
     MessageBus*    bus{nullptr};
-    std::atomic<uint64_t> reqCount{0};
+    std::shared_ptr<State> state{std::make_shared<State>()};
 };
 
 Replier::Replier(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -104,7 +114,7 @@ Replier::~Replier() {
     }
 }
 const std::string& Replier::service()      const { return impl_->service; }
-uint64_t           Replier::requestCount() const { return impl_->reqCount.load(); }
+uint64_t           Replier::requestCount() const { return impl_->state->reqCount.load(); }
 
 
 // ===================== MessageBus =====================
@@ -122,15 +132,32 @@ void MessageBus::start(int cpuAffinity) {
 
     // 定期处理重传超时
     retryTimerId_ = timerWheel_.addPeriodic(200, [this]() {
-        auto abandoned = qosEngine_.processTimeouts();
-        for (auto seqId : abandoned) {
+        // 发布可靠消息(QoS1/2)的重传/放弃：放弃的是发布 seqId，与请求的
+        // correlationId 属于不同命名空间，绝不能用它去索引 pendingRequests_。
+        qosEngine_.processTimeouts();
+        // 周期清理 QoS2 去重窗口，避免长期运行内存无界增长。
+        qosEngine_.cleanupDedupWindow();
+
+        // 请求超时：按截止时间结束仍在等待的请求，避免远端无响应时 future 永久挂起。
+        auto now = std::chrono::steady_clock::now();
+        std::vector<std::promise<Payload>> expired;
+        {
             std::lock_guard<std::mutex> lock(pendingReqMutex_);
-            auto it = pendingRequests_.find(seqId);
-            if (it != pendingRequests_.end()) {
-                it->second.set_exception(std::make_exception_ptr(
-                    std::runtime_error("request timeout")));
-                pendingRequests_.erase(it);
+            for (auto it = pendingRequests_.begin(); it != pendingRequests_.end(); ) {
+                if (now >= it->second.deadline) {
+                    expired.push_back(std::move(it->second.promise));
+                    it = pendingRequests_.erase(it);
+                } else {
+                    ++it;
+                }
             }
+        }
+        // 锁外设置异常，避免在持锁状态下执行 future 续延逻辑
+        for (auto& p : expired) {
+            try {
+                p.set_exception(std::make_exception_ptr(
+                    std::runtime_error("request timeout")));
+            } catch (...) {}
         }
     });
 }
@@ -140,9 +167,9 @@ void MessageBus::stop() {
         timerWheel_.stop();
         // 放弃所有待处理请求
         std::lock_guard<std::mutex> lock(pendingReqMutex_);
-        for (auto& [id, promise] : pendingRequests_) {
+        for (auto& [id, pr] : pendingRequests_) {
             try {
-                promise.set_exception(std::make_exception_ptr(
+                pr.promise.set_exception(std::make_exception_ptr(
                     std::runtime_error("bus stopped")));
             } catch (...) {}
         }
@@ -168,10 +195,12 @@ std::unique_ptr<Subscriber> MessageBus::createSubscriber(
     impl->qos   = qos;
     impl->bus   = this;
 
-    auto* implPtr = impl.get();
-    uint64_t subId = router_.addSubscription(topic, [implPtr, cb](const ReceivedMessage& msg) {
-        if (!implPtr->paused) {
-            implPtr->msgCount++;
+    std::weak_ptr<Subscriber::Impl::State> wstate = impl->state;
+    uint64_t subId = router_.addSubscription(topic, [wstate, cb](const ReceivedMessage& msg) {
+        auto s = wstate.lock();
+        if (!s) return; // Subscriber 已销毁，安全跳过
+        if (!s->paused.load()) {
+            s->msgCount++;
             cb(msg);
         }
     }, qos);
@@ -181,8 +210,8 @@ std::unique_ptr<Subscriber> MessageBus::createSubscriber(
     if (qos.durability == DurabilityKind::TransientLocal) {
         auto retained = retainedStore_.get(topic);
         if (retained) {
-            if (!impl->paused) {
-                impl->msgCount++;
+            if (!impl->state->paused.load()) {
+                impl->state->msgCount++;
                 cb(*retained);
             }
         }
@@ -209,12 +238,12 @@ std::unique_ptr<Replier> MessageBus::createReplier(
     impl->qos     = qos;
     impl->bus     = this;
 
-    auto* implPtr = impl.get();
+    std::weak_ptr<Replier::Impl::State> wstate = impl->state;
     {
         std::lock_guard<std::mutex> lock(serviceMutex_);
-        serviceHandlers_[service] = [implPtr, h = std::move(handler)](
+        serviceHandlers_[service] = [wstate, h = std::move(handler)](
             const ReceivedMessage& req) -> Payload {
-            implPtr->reqCount++;
+            if (auto s = wstate.lock()) s->reqCount++;
             return h(req);
         };
     }
@@ -388,11 +417,19 @@ void MessageBus::onReceived(const Endpoint& from,
     }
 
     if (msgType == MessageType::REPLY) {
-        std::lock_guard<std::mutex> lock(pendingReqMutex_);
-        auto it = pendingRequests_.find(result.header.correlationId);
-        if (it != pendingRequests_.end()) {
-            it->second.set_value(result.payload);
-            pendingRequests_.erase(it);
+        std::promise<Payload> p;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(pendingReqMutex_);
+            auto it = pendingRequests_.find(result.header.correlationId);
+            if (it != pendingRequests_.end()) {
+                p = std::move(it->second.promise);
+                pendingRequests_.erase(it);
+                found = true;
+            }
+        }
+        if (found) {
+            try { p.set_value(result.payload); } catch (...) {}
         }
         return;
     }
@@ -402,6 +439,13 @@ void MessageBus::onPeerDiscovered(const PeerInfo& peer) {
     std::lock_guard<std::mutex> lock(peerMutex_);
     peers_[peer.id] = peer;
     EMQ_LOG_I("MessageBus", "Peer discovered: %s (id=%u)", peer.name.c_str(), peer.id);
+}
+
+void MessageBus::onPeerUpdated(const PeerInfo& peer) {
+    // 对端订阅/端点变化：刷新路由表，避免已发现对端后续新增订阅时跨节点投递失败
+    std::lock_guard<std::mutex> lock(peerMutex_);
+    peers_[peer.id] = peer;
+    EMQ_LOG_D("MessageBus", "Peer updated: %s (id=%u)", peer.name.c_str(), peer.id);
 }
 
 void MessageBus::onPeerLost(uint16_t peerId) {
@@ -492,9 +536,15 @@ std::future<Payload> MessageBus::sendRequest(const std::string& service,
     std::promise<Payload> promise;
     auto future = promise.get_future();
 
+    // 请求级截止时间：远端无响应时由 start() 的周期任务结束该 future。
+    uint64_t timeoutMs = qos.ackTimeoutMs
+        ? static_cast<uint64_t>(qos.ackTimeoutMs) * (qos.maxRetries + 1)
+        : 5000;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(timeoutMs);
     {
         std::lock_guard<std::mutex> lock(pendingReqMutex_);
-        pendingRequests_[corrId] = std::move(promise);
+        pendingRequests_[corrId] = PendingRequest{ std::move(promise), deadline };
     }
 
     // 先找本地的 service handler
@@ -515,12 +565,18 @@ std::future<Payload> MessageBus::sendRequest(const std::string& service,
         req.correlationId = corrId;
         Payload response  = handler(req);
 
-        std::lock_guard<std::mutex> lock(pendingReqMutex_);
-        auto it = pendingRequests_.find(corrId);
-        if (it != pendingRequests_.end()) {
-            it->second.set_value(response);
-            pendingRequests_.erase(it);
+        std::promise<Payload> p;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(pendingReqMutex_);
+            auto it = pendingRequests_.find(corrId);
+            if (it != pendingRequests_.end()) {
+                p = std::move(it->second.promise);
+                pendingRequests_.erase(it);
+                found = true;
+            }
         }
+        if (found) { try { p.set_value(response); } catch (...) {} }
     } else {
         // 远端服务：编码为 REQUEST 并发送，携带 correlationId
         std::string svcTopic = "$SVC/" + service;
@@ -545,6 +601,25 @@ std::future<Payload> MessageBus::sendRequest(const std::string& service,
                 svcTopic, payload, qos, seqId, corrId);
             for (auto& ep : targets) {
                 if (transportMgr_) transportMgr_->send(ep, data.data(), data.size());
+            }
+        } else {
+            // 找不到提供该服务的对端：立即结束 future，避免永久挂起
+            std::promise<Payload> p;
+            bool found = false;
+            {
+                std::lock_guard<std::mutex> lock(pendingReqMutex_);
+                auto it = pendingRequests_.find(corrId);
+                if (it != pendingRequests_.end()) {
+                    p = std::move(it->second.promise);
+                    pendingRequests_.erase(it);
+                    found = true;
+                }
+            }
+            if (found) {
+                try {
+                    p.set_exception(std::make_exception_ptr(
+                        std::runtime_error("no provider for service: " + service)));
+                } catch (...) {}
             }
         }
     }

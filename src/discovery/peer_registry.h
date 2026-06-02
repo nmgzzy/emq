@@ -20,19 +20,31 @@ public:
     using PeerDiscoveredCb = std::function<void(const PeerInfo&)>;
     using PeerLostCb       = std::function<void(uint16_t, const std::string&)>;
     using PeerWillCb       = std::function<void(const PeerInfo&)>;
+    using PeerUpdatedCb    = std::function<void(const PeerInfo&)>;
 
     void setOnDiscovered(PeerDiscoveredCb cb) { onDiscovered_ = std::move(cb); }
     void setOnLost(PeerLostCb cb)             { onLost_       = std::move(cb); }
     void setOnWill(PeerWillCb cb)             { onWill_       = std::move(cb); }
+    void setOnUpdated(PeerUpdatedCb cb)       { onUpdated_    = std::move(cb); }
 
     void addOrUpdate(const PeerInfo& peer) {
-        bool isNew = false;
+        bool isNew    = false;
+        bool changed  = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            isNew = (records_.find(peer.id) == records_.end());
+            auto it = records_.find(peer.id);
+            isNew = (it == records_.end());
+            if (!isNew) {
+                // 订阅列表或端点发生变化时需要通知上层刷新路由表
+                const PeerInfo& old = it->second.info;
+                changed = (old.subscribedTopics != peer.subscribedTopics) ||
+                          (old.publishedTopics  != peer.publishedTopics)  ||
+                          (old.endpoints        != peer.endpoints);
+            }
             records_[peer.id] = {peer, std::chrono::steady_clock::now(), true};
         }
-        if (isNew && onDiscovered_) onDiscovered_(peer);
+        if (isNew && onDiscovered_)        onDiscovered_(peer);
+        else if (changed && onUpdated_)    onUpdated_(peer);
     }
 
     /// 移除对端。triggerWill=true 表示异常掉线（超时），需要代为发布其遗嘱；
@@ -103,6 +115,7 @@ private:
     PeerDiscoveredCb                           onDiscovered_;
     PeerLostCb                                 onLost_;
     PeerWillCb                                 onWill_;
+    PeerUpdatedCb                              onUpdated_;
 };
 
 } // namespace embedmq

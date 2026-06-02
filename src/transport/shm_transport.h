@@ -44,6 +44,9 @@ public:
 
     const std::string& instanceName() const { return name_; }
 
+    // 因收件箱满或槽位竞争而丢弃的消息数（可观测背压）
+    uint64_t droppedCount() const { return dropped_.load(std::memory_order_relaxed); }
+
 private:
     struct Region;             // 平台相关的映射句柄（pImpl）
     struct ShmHeader;
@@ -59,6 +62,7 @@ private:
 
     Region*      inbox_{nullptr};     // 本实例收件箱（消费者）
     std::atomic<bool>      active_{false};
+    std::atomic<uint64_t>  dropped_{0};
     std::thread            recvThread_;
     TransportRecvCallback  recvCb_;
     TransportEventCallback eventCb_;

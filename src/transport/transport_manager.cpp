@@ -41,6 +41,7 @@ void TransportManager::initAll(const ParticipantConfig& config) {
         std::string cfg = "{\"port\":" + std::to_string(config.transport.udpPort) + ","
                         + "\"multicast_group\":\"" + config.discovery.multicastGroup + "\","
                         + "\"multicast_port\":" + std::to_string(config.discovery.multicastPort) + ","
+                        + "\"multicast_enabled\":" + (config.discovery.enableMulticast ? "1" : "0") + ","
                         + "\"shm_name\":\"" + shmName + "\"}";
 
         if (!transport->init(cfg)) {
@@ -96,7 +97,9 @@ bool TransportManager::broadcast(const uint8_t* data, size_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
     bool ok = false;
     for (auto& [name, transport] : transports_) {
-        if (transport->isActive()) {
+        // 仅向声明支持广播的传输发送（当前即 UDP 多播），避免对 TCP/SHM 等
+        // 无广播语义的传输做无意义或未来误行为的调用
+        if (transport->isActive() && transport->capability().supportsBroadcast) {
             ok |= transport->broadcast(data, size);
         }
     }

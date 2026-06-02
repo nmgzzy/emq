@@ -25,6 +25,8 @@ public:
     void setOnPeerLost(std::function<void(uint16_t, const std::string&)> cb);
     // 对端异常掉线时触发其遗嘱（携带遗嘱主题/载荷的对端信息）
     void setOnPeerWill(std::function<void(const PeerInfo&)> cb);
+    // 已知对端的订阅/端点发生变化时触发（用于刷新路由表）
+    void setOnPeerUpdated(std::function<void(const PeerInfo&)> cb);
 
     void start();
     void stop();
@@ -64,6 +66,7 @@ private:
     std::function<void(const PeerInfo&)>              onPeerDiscovered_;
     std::function<void(uint16_t, const std::string&)> onPeerLost_;
     std::function<void(const PeerInfo&)>              onPeerWill_;
+    std::function<void(const PeerInfo&)>              onPeerUpdated_;
 };
 
 } // namespace embedmq

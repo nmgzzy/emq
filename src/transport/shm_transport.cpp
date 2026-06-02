@@ -219,7 +219,10 @@ bool ShmTransport::writeToRegion(Region* r, const uint8_t* data, size_t size) {
     for (;;) {
         uint32_t head = h->head.load(std::memory_order_acquire);
         uint32_t tail = h->tail.load(std::memory_order_acquire);
-        if (head - tail >= cap) return false; // 收件箱已满 → 丢弃
+        if (head - tail >= cap) {            // 收件箱已满 → 丢弃（可观测背压）
+            dropped_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         if (h->head.compare_exchange_weak(head, head + 1,
                 std::memory_order_acq_rel)) {
             idx = head;
@@ -232,11 +235,24 @@ bool ShmTransport::writeToRegion(Region* r, const uint8_t* data, size_t size) {
                        static_cast<size_t>(idx % cap) * ssize;
     auto* sh = reinterpret_cast<SlotHeader*>(slotPtr);
 
-    // 等待该槽位被消费者清空（容量检查后通常已空，做有界防御性自旋）
+    // 容量不变量保证此槽（上一占用者为 idx-cap）已被消费者置空，自旋仅用于等待
+    // 消费者 EMPTY 写入的可见性，正常情况下不会循环。
+    bool empty = false;
     for (int spin = 0; spin < 100000; ++spin) {
-        if (sh->state.load(std::memory_order_acquire) == SLOT_EMPTY) break;
+        if (sh->state.load(std::memory_order_acquire) == SLOT_EMPTY) { empty = true; break; }
         std::this_thread::yield();
     }
+
+    if (!empty) {
+        // 异常：消费者长时间未推进（可能卡死）。已 CAS 预留的槽不能回滚，否则
+        // 消费者会永久停在该 tail。这里写入零长度 READY 占位让消费者跳过并推进，
+        // 避免数据竞争/损坏，同时把本条消息记为丢弃。
+        sh->len = 0;
+        sh->state.store(SLOT_READY, std::memory_order_release);
+        dropped_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
     sh->len = static_cast<uint32_t>(size);
     std::memcpy(slotPtr + sizeof(SlotHeader), data, size);
     sh->state.store(SLOT_READY, std::memory_order_release);

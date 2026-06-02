@@ -31,6 +31,9 @@ DiscoveryAgent::DiscoveryAgent(uint16_t nodeId,
     registry_.setOnWill([this](const PeerInfo& p) {
         if (onPeerWill_) onPeerWill_(p);
     });
+    registry_.setOnUpdated([this](const PeerInfo& p) {
+        if (onPeerUpdated_) onPeerUpdated_(p);
+    });
 }
 
 DiscoveryAgent::~DiscoveryAgent() { stop(); }
@@ -47,7 +50,17 @@ void DiscoveryAgent::setOnPeerWill(std::function<void(const PeerInfo&)> cb) {
     onPeerWill_ = std::move(cb);
 }
 
+void DiscoveryAgent::setOnPeerUpdated(std::function<void(const PeerInfo&)> cb) {
+    onPeerUpdated_ = std::move(cb);
+}
+
 void DiscoveryAgent::start() {
+    // 关闭本地自动发现：不启动 announce/heartbeat/timeout，节点仅依赖静态配置或不互联
+    if (!config_.discovery.enableLocalDiscovery) {
+        EMQ_LOG_I("Discovery", "Local discovery disabled (id=%u)", nodeId_);
+        return;
+    }
+
     running_ = true;
     if (config_.threading.pinCpu)
         timerWheel_.setAffinity(config_.threading.cpuAffinity);

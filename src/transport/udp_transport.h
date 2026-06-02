@@ -39,6 +39,7 @@ private:
     uint16_t  localPort_{0};
     std::string multicastGroup_{"239.255.0.1"};
     uint16_t    multicastPort_{19900};
+    bool        multicastEnabled_{true};
 
     std::atomic<bool>     active_{false};
     std::thread           recvThread_;

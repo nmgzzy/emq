@@ -11,6 +11,10 @@ namespace embedmq {
 constexpr uint16_t EMBEDMQ_MAGIC     = 0xEBDC;
 constexpr uint8_t  EMBEDMQ_VERSION   = 1;
 
+// 单条消息的字段上限（编码前校验，避免静默截断 / 解码越界）
+constexpr size_t   MAX_TOPIC_LEN     = 0xFFFF;        // topicLen 为 uint16_t
+constexpr size_t   MAX_PAYLOAD_LEN   = 64u * 1024 * 1024; // 64 MiB 上限
+
 // WireHeader 实际占用 40 字节（#pragma pack 保证无填充）
 // magic(2)+version(1)+msgType(1)+qosLevel(1)+flags(1)+sourceId(2)
 // +destId(2)+topicLen(2)+sequenceId(4)+correlationId(4)
@@ -53,6 +57,10 @@ public:
         uint8_t  flags         = 0,
         uint8_t  serializerId  = 0)
     {
+        // 超限输入直接拒绝，避免 static_cast 静默回绕导致对端解出错误数据
+        if (topic.size() > MAX_TOPIC_LEN || payload.size() > MAX_PAYLOAD_LEN)
+            return {};
+
         WireHeader header{};
         header.magic         = EMBEDMQ_MAGIC;
         header.version       = EMBEDMQ_VERSION;
@@ -100,6 +108,9 @@ public:
         uint8_t  flags         = 0,
         uint8_t  serializerId  = 0)
     {
+        if (topic.size() > MAX_TOPIC_LEN || payload.size() > MAX_PAYLOAD_LEN)
+            return {};
+
         WireHeader header{};
         header.magic         = EMBEDMQ_MAGIC;
         header.version       = EMBEDMQ_VERSION;
@@ -149,10 +160,12 @@ public:
         if (result.header.magic   != EMBEDMQ_MAGIC)   return result;
         if (result.header.version != EMBEDMQ_VERSION) return result;
 
-        size_t expectedSize = HEADER_FIXED_SIZE +
-                              result.header.topicLen +
-                              result.header.payloadLen;
-        if (size < expectedSize) return result;
+        // 用 64 位累加避免 32 位 size_t 下 HEADER+topicLen+payloadLen 回绕，
+        // 否则构造的恶意/损坏包头可绕过 size 检查导致越界读。
+        uint64_t expectedSize = static_cast<uint64_t>(HEADER_FIXED_SIZE) +
+                                result.header.topicLen +
+                                result.header.payloadLen;
+        if (static_cast<uint64_t>(size) < expectedSize) return result;
 
         // CRC32 验证（不修改输入缓冲区）
         uint32_t savedCrc = result.header.checksum;
@@ -162,7 +175,7 @@ public:
         crcState = util::crc32_update(crcState, data + 4, CHECKSUM_OFFSET - 4);
         crcState = util::crc32_update(crcState, ZERO4, 4);
         crcState = util::crc32_update(crcState, data + CHECKSUM_OFFSET + 4,
-                                       expectedSize - CHECKSUM_OFFSET - 4);
+                                       static_cast<size_t>(expectedSize) - CHECKSUM_OFFSET - 4);
         uint32_t calcCrc = ~crcState;
 
         if (calcCrc != savedCrc) return result;

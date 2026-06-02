@@ -42,6 +42,8 @@ void UdpTransport::parseConfig(const std::string& cfg) {
     if (!mp.empty()) {
         try { multicastPort_ = static_cast<uint16_t>(std::stoi(mp)); } catch(...) {}
     }
+    std::string me = extract("multicast_enabled");
+    if (!me.empty()) multicastEnabled_ = (me != "0");
 }
 
 bool UdpTransport::init(const std::string& config) {
@@ -63,8 +65,8 @@ bool UdpTransport::init(const std::string& config) {
     }
     localPort_ = platform::SocketApi::getLocalPort(unicastFd_);
 
-    // 多播接收 socket
-    multicastFd_ = platform::SocketApi::createUdp();
+    // 多播接收 socket（仅在启用多播时创建并加入多播组）
+    multicastFd_ = multicastEnabled_ ? platform::SocketApi::createUdp() : INVALID_SOCK;
     if (multicastFd_ != INVALID_SOCK) {
         platform::SocketApi::setReuseAddr(multicastFd_);
 #ifdef EMQ_PLATFORM_POSIX
@@ -122,6 +124,7 @@ bool UdpTransport::sendv(const Endpoint& to, const IoSlice* slices, size_t count
 
 bool UdpTransport::broadcast(const uint8_t* data, size_t size) {
     if (!active_ || unicastFd_ == INVALID_SOCK) return false;
+    if (!multicastEnabled_) return false; // 多播关闭时不做组播广播
     int n = platform::SocketApi::sendTo(unicastFd_, data, static_cast<int>(size),
                                          multicastGroup_, multicastPort_);
     return n == static_cast<int>(size);
