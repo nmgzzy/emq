@@ -17,7 +17,22 @@
 #include <unistd.h>
 #endif
 
+#if defined(EMQ_PLATFORM_LINUX)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <ctime>
+#endif
+
 namespace embedmq {
+
+#if defined(EMQ_PLATFORM_LINUX)
+// 跨进程 futex：作用于共享内存中的 32 位字（按物理页定位，可跨进程唤醒）
+static inline int shmFutex(std::atomic<uint32_t>* addr, int op,
+                           uint32_t val, const struct timespec* ts) {
+    return static_cast<int>(::syscall(SYS_futex,
+        reinterpret_cast<uint32_t*>(addr), op, val, ts, nullptr, 0));
+}
+#endif
 
 // ===================== 共享内存布局 =====================
 //
@@ -28,17 +43,20 @@ namespace embedmq {
 // 生产者通过对 head 做 CAS 预留槽位；消费者按 tail 顺序读取。
 
 struct ShmTransport::ShmHeader {
-    uint32_t              magic;       // 校验段有效性
+    uint32_t              magic;         // 校验段有效性
+    uint32_t              layoutVersion; // 布局版本：不匹配则拒绝映射
     uint32_t              slotSize;
     uint32_t              slotCount;
+    std::atomic<uint32_t> head;          // 生产者预留索引
+    std::atomic<uint32_t> tail;          // 消费者读取索引
+    std::atomic<uint32_t> notify;        // 事件唤醒序号（Linux futex）
     uint32_t              _pad;
-    std::atomic<uint32_t> head;        // 生产者预留索引
-    std::atomic<uint32_t> tail;        // 消费者读取索引
 };
 
-static constexpr uint32_t SHM_MAGIC      = 0x4D485345; // "ESHM"
-static constexpr uint32_t SLOT_EMPTY     = 0;
-static constexpr uint32_t SLOT_READY     = 1;
+static constexpr uint32_t SHM_MAGIC          = 0x4D485345; // "ESHM"
+static constexpr uint32_t SHM_LAYOUT_VERSION = 1;
+static constexpr uint32_t SLOT_EMPTY         = 0;
+static constexpr uint32_t SLOT_READY         = 1;
 
 namespace {
 struct SlotHeader {
@@ -150,13 +168,21 @@ ShmTransport::Region* ShmTransport::openInbox(const std::string& name, bool crea
     }
     if (!r->mapping) { delete r; return nullptr; }
     bool existed = (::GetLastError() == ERROR_ALREADY_EXISTS);
-    r->base = ::MapViewOfFile(r->mapping, FILE_MAP_ALL_ACCESS, 0, 0, r->totalSize);
+    // 非创建时映射整个 section（传 0），避免按本地几何 under-map
+    SIZE_T mapBytes = create ? r->totalSize : 0;
+    r->base = ::MapViewOfFile(r->mapping, FILE_MAP_ALL_ACCESS, 0, 0, mapBytes);
     if (!r->base) { ::CloseHandle(r->mapping); delete r; return nullptr; }
+    if (!create) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(r->base, &mbi, sizeof(mbi)) != 0)
+            r->totalSize = static_cast<size_t>(mbi.RegionSize);
+    }
     if (create && !existed) {
         std::memset(r->base, 0, r->totalSize);
         ShmHeader* h = r->header();
-        h->magic = SHM_MAGIC; h->slotSize = slotSize_; h->slotCount = slotCount_;
-        h->head.store(0); h->tail.store(0);
+        h->magic = SHM_MAGIC; h->layoutVersion = SHM_LAYOUT_VERSION;
+        h->slotSize = slotSize_; h->slotCount = slotCount_;
+        h->head.store(0); h->tail.store(0); h->notify.store(0);
     }
 #else
     r->shmPath = "/" + name; // POSIX 名字以 '/' 开头
@@ -167,6 +193,11 @@ ShmTransport::Region* ShmTransport::openInbox(const std::string& name, bool crea
         if (::ftruncate(r->fd, static_cast<off_t>(r->totalSize)) != 0) {
             ::close(r->fd); delete r; return nullptr;
         }
+    } else {
+        // 打开对端段：以对端实际段大小映射，避免按本地几何 under-map 造成越界访问
+        struct stat st{};
+        if (::fstat(r->fd, &st) == 0 && st.st_size > 0)
+            r->totalSize = static_cast<size_t>(st.st_size);
     }
     r->base = ::mmap(nullptr, r->totalSize, PROT_READ | PROT_WRITE,
                      MAP_SHARED, r->fd, 0);
@@ -178,18 +209,23 @@ ShmTransport::Region* ShmTransport::openInbox(const std::string& name, bool crea
         // 仅首次创建时初始化（magic 未匹配即视为全新段）
         if (h->magic != SHM_MAGIC) {
             std::memset(r->base, 0, r->totalSize);
-            h->magic = SHM_MAGIC; h->slotSize = slotSize_; h->slotCount = slotCount_;
-            h->head.store(0); h->tail.store(0);
+            h->magic = SHM_MAGIC; h->layoutVersion = SHM_LAYOUT_VERSION;
+            h->slotSize = slotSize_; h->slotCount = slotCount_;
+            h->head.store(0); h->tail.store(0); h->notify.store(0);
         }
     }
 #endif
 
-    // 打开（非创建）时校验段是否就绪
+    // 打开（非创建）时校验段是否就绪、布局版本与几何一致
     if (!create) {
         ShmHeader* h = r->header();
-        if (h->magic != SHM_MAGIC) { closeRegion(r); return nullptr; }
-        // 以对端的实际几何为准
-        if (h->slotCount == 0 || h->slotSize == 0) { closeRegion(r); return nullptr; }
+        if (h->magic != SHM_MAGIC)                  { closeRegion(r); return nullptr; }
+        if (h->layoutVersion != SHM_LAYOUT_VERSION) { closeRegion(r); return nullptr; }
+        if (h->slotCount == 0 || h->slotSize == 0)  { closeRegion(r); return nullptr; }
+        // 校验映射大小能容纳声明的几何，防止越界
+        size_t need = sizeof(ShmHeader) +
+                      static_cast<size_t>(h->slotCount) * h->slotSize;
+        if (r->totalSize < need)                    { closeRegion(r); return nullptr; }
     }
     return r;
 }
@@ -250,33 +286,115 @@ bool ShmTransport::writeToRegion(Region* r, const uint8_t* data, size_t size) {
         sh->len = 0;
         sh->state.store(SLOT_READY, std::memory_order_release);
         dropped_.fetch_add(1, std::memory_order_relaxed);
+        wakeConsumer(h);
         return false;
     }
 
     sh->len = static_cast<uint32_t>(size);
     std::memcpy(slotPtr + sizeof(SlotHeader), data, size);
     sh->state.store(SLOT_READY, std::memory_order_release);
+    wakeConsumer(h);
     return true;
+}
+
+void ShmTransport::wakeConsumer(ShmHeader* h) {
+    // 递增唤醒序号并唤醒可能在 futex 上等待的消费者（Linux）
+    h->notify.fetch_add(1, std::memory_order_release);
+#if defined(EMQ_PLATFORM_LINUX)
+    shmFutex(&h->notify, FUTEX_WAKE, 1, nullptr);
+#endif
+}
+
+ShmTransport::Region* ShmTransport::resolvePeer(const std::string& target) {
+    std::lock_guard<std::mutex> lock(peerMutex_);
+    auto it = peerRegions_.find(target);
+    if (it != peerRegions_.end()) {
+        // 校验缓存的对端段仍然有效（对端退出后段可能被 unlink/重建）
+        ShmHeader* h = it->second->header();
+        if (h && h->magic == SHM_MAGIC && h->layoutVersion == SHM_LAYOUT_VERSION)
+            return it->second;
+        // 失效：回收映射并从缓存移除
+        closeRegion(it->second);
+        peerRegions_.erase(it);
+    }
+    Region* r = openInbox(target, /*create=*/false);
+    if (r) peerRegions_[target] = r;
+    return r;
 }
 
 bool ShmTransport::send(const Endpoint& to, const uint8_t* data, size_t size) {
     if (!active_) return false;
     const std::string& target = to.address;
     if (target.empty()) return false;
-
-    Region* r = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(peerMutex_);
-        auto it = peerRegions_.find(target);
-        if (it != peerRegions_.end()) {
-            r = it->second;
-        } else {
-            r = openInbox(target, /*create=*/false);
-            if (r) peerRegions_[target] = r;
-        }
-    }
+    Region* r = resolvePeer(target);
     if (!r) return false;
     return writeToRegion(r, data, size);
+}
+
+// 原生 scatter/gather：将多个分片直接 gather-copy 进单个槽位，
+// 避免调用方先拼接成连续缓冲（保持零拷贝语义到传输边界）。
+bool ShmTransport::writevToRegion(Region* r, const IoSlice* slices, size_t count) {
+    if (!r || !r->base) return false;
+    ShmHeader* h = r->header();
+    const uint32_t cap   = h->slotCount;
+    const uint32_t ssize = h->slotSize;
+
+    size_t total = 0;
+    for (size_t i = 0; i < count; ++i) total += slices[i].len;
+    if (total + sizeof(SlotHeader) > ssize) return false;
+
+    uint32_t idx;
+    for (;;) {
+        uint32_t head = h->head.load(std::memory_order_acquire);
+        uint32_t tail = h->tail.load(std::memory_order_acquire);
+        if (head - tail >= cap) {
+            dropped_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (h->head.compare_exchange_weak(head, head + 1, std::memory_order_acq_rel)) {
+            idx = head;
+            break;
+        }
+    }
+
+    uint8_t* slotPtr = reinterpret_cast<uint8_t*>(r->base) + sizeof(ShmHeader) +
+                       static_cast<size_t>(idx % cap) * ssize;
+    auto* sh = reinterpret_cast<SlotHeader*>(slotPtr);
+
+    bool empty = false;
+    for (int spin = 0; spin < 100000; ++spin) {
+        if (sh->state.load(std::memory_order_acquire) == SLOT_EMPTY) { empty = true; break; }
+        std::this_thread::yield();
+    }
+    if (!empty) {
+        sh->len = 0;
+        sh->state.store(SLOT_READY, std::memory_order_release);
+        dropped_.fetch_add(1, std::memory_order_relaxed);
+        wakeConsumer(h);
+        return false;
+    }
+
+    uint8_t* dst = slotPtr + sizeof(SlotHeader);
+    size_t off = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (slices[i].len) {
+            std::memcpy(dst + off, slices[i].data, slices[i].len);
+            off += slices[i].len;
+        }
+    }
+    sh->len = static_cast<uint32_t>(total);
+    sh->state.store(SLOT_READY, std::memory_order_release);
+    wakeConsumer(h);
+    return true;
+}
+
+bool ShmTransport::sendv(const Endpoint& to, const IoSlice* slices, size_t count) {
+    if (!active_) return false;
+    const std::string& target = to.address;
+    if (target.empty()) return false;
+    Region* r = resolvePeer(target);
+    if (!r) return false;
+    return writevToRegion(r, slices, count);
 }
 
 bool ShmTransport::broadcast(const uint8_t* /*data*/, size_t /*size*/) {
@@ -326,7 +444,17 @@ void ShmTransport::recvLoop() {
             gotAny = true;
         }
         if (!gotAny) {
+#if defined(EMQ_PLATFORM_LINUX)
+            // 事件驱动：无数据时在 notify 上等待，带 2ms 超时兜底（避免错过唤醒/关停延迟）
+            uint32_t v = h->notify.load(std::memory_order_acquire);
+            if (h->tail.load(std::memory_order_acquire) ==
+                h->head.load(std::memory_order_acquire)) {
+                struct timespec ts{0, 2 * 1000 * 1000};
+                shmFutex(&h->notify, FUTEX_WAIT, v, &ts);
+            }
+#else
             std::this_thread::sleep_for(std::chrono::microseconds(200));
+#endif
         }
     }
 }

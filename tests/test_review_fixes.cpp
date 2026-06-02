@@ -25,16 +25,18 @@ TEST(encode_rejects_oversized_topic) {
 }
 
 // decode：声明的 topicLen/payloadLen 超过实际缓冲应判为无效（防越界读）
+// 使用协议 v2 紧凑头偏移：topicLen@12..13，payloadLen@22..25，hdrFlags@4。
 TEST(decode_rejects_length_overflow) {
-    std::vector<uint8_t> buf(HEADER_FIXED_SIZE, 0);
+    std::vector<uint8_t> buf(HEADER_BASE_SIZE, 0);
     buf[0] = static_cast<uint8_t>(EMBEDMQ_MAGIC & 0xFF);
     buf[1] = static_cast<uint8_t>((EMBEDMQ_MAGIC >> 8) & 0xFF);
     buf[2] = EMBEDMQ_VERSION;
     buf[3] = static_cast<uint8_t>(MessageType::PUBLISH);
-    // topicLen = 0xFFFF（偏移 10..11）
-    buf[10] = 0xFF; buf[11] = 0xFF;
-    // payloadLen = 0xFFFFFFFF（偏移 32..35）
-    buf[32] = 0xFF; buf[33] = 0xFF; buf[34] = 0xFF; buf[35] = 0xFF;
+    buf[4] = 0; // hdrFlags：无 TS / 无 CRC，使基础头自洽
+    // topicLen = 0xFFFF（偏移 12..13）
+    buf[12] = 0xFF; buf[13] = 0xFF;
+    // payloadLen = 0xFFFFFFFF（偏移 22..25）
+    buf[22] = 0xFF; buf[23] = 0xFF; buf[24] = 0xFF; buf[25] = 0xFF;
 
     auto result = MessageCodec::decode(buf.data(), buf.size());
     CHECK_FALSE(result.valid);

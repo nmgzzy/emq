@@ -1,7 +1,9 @@
 #pragma once
 #include "embedmq/transport/itransport.h"
 #include "../platform/socket_api.h"
+#include "../platform/event_loop.h"
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -32,10 +34,16 @@ public:
 
 private:
     void recvLoop();
+    void processFd(SockFd fd);
     void parseConfig(const std::string& jsonConfig);
 
     SockFd    unicastFd_{INVALID_SOCK};
     SockFd    multicastFd_{INVALID_SOCK};
+    std::unique_ptr<platform::EventLoop> eventLoop_; // Linux: epoll 反应堆，替代 select
+    std::vector<uint8_t>                 recvBuf_;
+    // 单数据报接收缓冲上限（可由 config.transport.udpRecvBufferSize 配置）。
+    // 注意：UDP 语义下超过该长度的数据报会被内核截断。
+    uint32_t  recvBufferSize_{65536};
     uint16_t  localPort_{0};
     std::string multicastGroup_{"239.255.0.1"};
     uint16_t    multicastPort_{19900};

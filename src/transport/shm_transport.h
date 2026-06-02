@@ -34,6 +34,7 @@ public:
     void shutdown()                      override;
 
     bool send(const Endpoint& to, const uint8_t* data, size_t size) override;
+    bool sendv(const Endpoint& to, const IoSlice* slices, size_t count) override;
     bool broadcast(const uint8_t* data, size_t size)                 override;
 
     void setRecvCallback(TransportRecvCallback cb)   override;
@@ -55,6 +56,9 @@ private:
     Region* openInbox(const std::string& name, bool create);
     void    closeRegion(Region* r);
     bool    writeToRegion(Region* r, const uint8_t* data, size_t size);
+    bool    writevToRegion(Region* r, const IoSlice* slices, size_t count);
+    void    wakeConsumer(ShmHeader* h);
+    Region* resolvePeer(const std::string& target);
 
     std::string  name_;
     uint32_t     slotSize_{DEFAULT_SLOT_SIZE};

@@ -48,6 +48,7 @@ void Participant::Impl::init() {
     transportMgr->initAll(config);
 
     messageBus = std::make_unique<MessageBus>(id, transportMgr.get());
+    messageBus->setChecksumEnabled(config.enableChecksum);
 
     discovery = std::make_unique<DiscoveryAgent>(
         id, name, config, transportMgr.get());

@@ -86,20 +86,47 @@ void TcpTransport::removeConnection(const Endpoint& ep) {
     connections_.erase(key);
 }
 
+static inline void encodeLen(uint32_t len, uint8_t lenBuf[4]) {
+    lenBuf[0] = (len >> 24) & 0xFF;
+    lenBuf[1] = (len >> 16) & 0xFF;
+    lenBuf[2] = (len >>  8) & 0xFF;
+    lenBuf[3] =  len        & 0xFF;
+}
+
 bool TcpTransport::send(const Endpoint& to, const uint8_t* data, size_t size) {
     if (!active_) return false;
     SockFd fd = getOrConnect(to);
     if (fd == INVALID_SOCK) return false;
 
-    uint32_t len = static_cast<uint32_t>(size);
     uint8_t lenBuf[4];
-    lenBuf[0] = (len >> 24) & 0xFF;
-    lenBuf[1] = (len >> 16) & 0xFF;
-    lenBuf[2] = (len >>  8) & 0xFF;
-    lenBuf[3] =  len        & 0xFF;
+    encodeLen(static_cast<uint32_t>(size), lenBuf);
 
+    // 串行化整帧写入，避免并发发送导致长度前缀与负载交错
+    std::lock_guard<std::mutex> lock(sendMutex_);
     if (!sendAll(fd, lenBuf, 4)) return false;
     return sendAll(fd, data, size);
+}
+
+// 原生 scatter/gather：一次长度前缀 + 逐分片写入，避免调用方拼接缓冲
+bool TcpTransport::sendv(const Endpoint& to, const IoSlice* slices, size_t count) {
+    if (!active_) return false;
+    SockFd fd = getOrConnect(to);
+    if (fd == INVALID_SOCK) return false;
+
+    size_t total = 0;
+    for (size_t i = 0; i < count; ++i) total += slices[i].len;
+
+    uint8_t lenBuf[4];
+    encodeLen(static_cast<uint32_t>(total), lenBuf);
+
+    std::lock_guard<std::mutex> lock(sendMutex_);
+    if (!sendAll(fd, lenBuf, 4)) return false;
+    for (size_t i = 0; i < count; ++i) {
+        if (slices[i].len &&
+            !sendAll(fd, static_cast<const uint8_t*>(slices[i].data), slices[i].len))
+            return false;
+    }
+    return true;
 }
 
 void TcpTransport::setRecvCallback(TransportRecvCallback cb) {

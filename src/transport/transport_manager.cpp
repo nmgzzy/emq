@@ -42,6 +42,7 @@ void TransportManager::initAll(const ParticipantConfig& config) {
                         + "\"multicast_group\":\"" + config.discovery.multicastGroup + "\","
                         + "\"multicast_port\":" + std::to_string(config.discovery.multicastPort) + ","
                         + "\"multicast_enabled\":" + (config.discovery.enableMulticast ? "1" : "0") + ","
+                        + "\"udp_recv_buffer_size\":" + std::to_string(config.transport.udpRecvBufferSize) + ","
                         + "\"shm_name\":\"" + shmName + "\"}";
 
         if (!transport->init(cfg)) {
@@ -123,6 +124,12 @@ ITransport* TransportManager::get(const std::string& name) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = transports_.find(name);
     return (it != transports_.end()) ? it->second.get() : nullptr;
+}
+
+bool TransportManager::isActive(const std::string& name) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = transports_.find(name);
+    return it != transports_.end() && it->second->isActive();
 }
 
 std::vector<Endpoint> TransportManager::allLocalEndpoints() const {

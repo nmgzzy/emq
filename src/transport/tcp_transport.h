@@ -22,6 +22,7 @@ public:
     void shutdown() override;
 
     bool send(const Endpoint& to, const uint8_t* data, size_t size) override;
+    bool sendv(const Endpoint& to, const IoSlice* slices, size_t count) override;
     bool broadcast(const uint8_t* data, size_t size) override { return false; }
 
     void setRecvCallback(TransportRecvCallback cb)   override;
@@ -45,6 +46,7 @@ private:
     std::unordered_map<std::string, SockFd>          connections_;
     std::vector<std::thread>                         clientThreads_;
     mutable std::mutex                               mutex_;
+    std::mutex                                       sendMutex_; // 串行化写，防止帧交错
     TransportRecvCallback                            recvCb_;
     TransportEventCallback                           eventCb_;
 };

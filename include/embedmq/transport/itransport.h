@@ -64,8 +64,11 @@ public:
     virtual bool send(const Endpoint& to, const uint8_t* data, size_t size) = 0;
     virtual bool broadcast(const uint8_t* data, size_t size) = 0;
 
-    /// 零拷贝 scatter/gather 发送（默认实现：拼接为连续缓冲后调用 send）。
-    /// 支持的传输（如 UDP）可重写为底层 sendmsg/WSASendTo 以避免拷贝。
+    /// scatter/gather 发送。
+    /// 约定：内置传输（UDP=sendmsg/WSASendTo、TCP=分片写、SHM=gather-copy 入槽）
+    /// 均原生重写本方法以保持零拷贝/少拷贝语义。
+    /// 此处默认实现仅为“正确性兜底”——拼接为连续缓冲后调用 send()，会发生一次额外拷贝，
+    /// 仅供未实现原生 sendv 的自定义传输使用。
     virtual bool sendv(const Endpoint& to, const IoSlice* slices, size_t count) {
         size_t total = 0;
         for (size_t i = 0; i < count; ++i) total += slices[i].len;

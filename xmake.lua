@@ -1,5 +1,5 @@
 set_project("EmbedMQ")
-set_version("0.3.0")
+set_version("0.4.0")
 set_xmakever("2.7.0")
 
 add_rules("mode.debug", "mode.release")
@@ -13,12 +13,27 @@ if is_plat("windows") then
 end
 
 -- ---- 选项 ----
+-- 构建画像：full（默认，开发/桌面，全特性）/ embedded（瘦身：关闭 TCP、示例、基准、io_uring）
+option("profile",        { default = "full", values = {"full", "embedded"},
+                           description = "Build profile: full | embedded" })
 option("build_tests",    { default = true,  description = "Build unit tests" })
 option("build_examples", { default = true,  description = "Build examples" })
 option("build_bench",    { default = true,  description = "Build performance benchmarks (Phase 3)" })
-option("enable_tcp",     { default = true,  description = "Enable TCP transport (Phase 2)" })
+-- TCP 默认关闭：嵌入式以 UDP/SHM 为主，按需显式开启 --enable_tcp=y
+option("enable_tcp",     { default = false, description = "Enable TCP transport (Phase 2)" })
 option("enable_shm",     { default = true,  description = "Enable shared-memory transport (Phase 3)" })
 option("enable_io_uring",{ default = false, description = "Enable io_uring event loop (Linux, experimental, Phase 3)" })
+
+-- 解析画像，得到各特性最终开关（embedded 为强约束的瘦身画像）
+local embedded     = (get_config("profile") == "embedded")
+local want_tcp     = has_config("enable_tcp")     and not embedded
+local want_shm     = has_config("enable_shm")
+local want_iouring = has_config("enable_io_uring") and not embedded
+local want_bench   = has_config("build_bench")    and not embedded
+local want_examples= has_config("build_examples") and not embedded
+if embedded then
+    add_defines("EMBEDMQ_EMBEDDED_PROFILE")
+end
 
 -- ---- 平台 PAL 源码选择 ----
 local pal_sources = {}
@@ -68,16 +83,16 @@ target("embedmq")
     -- transport
     add_files("src/transport/transport_manager.cpp")
     add_files("src/transport/udp_transport.cpp")
-    if has_config("enable_tcp") then
+    if want_tcp then
         add_defines("EMBEDMQ_ENABLE_TCP")
         add_files("src/transport/tcp_transport.cpp")
     end
-    if has_config("enable_shm") then
+    if want_shm then
         add_defines("EMBEDMQ_ENABLE_SHM", { public = true })
         add_files("src/transport/shm_transport.cpp")
     end
     -- io_uring（Linux 可选，实验性）：默认关闭，需内核 5.1+ 与 liburing
-    if has_config("enable_io_uring") and is_plat("linux") then
+    if want_iouring and is_plat("linux") then
         add_defines("EMBEDMQ_ENABLE_IO_URING")
         add_files("src/platform/event_loop_io_uring.cpp")
         add_syslinks("uring")
@@ -113,6 +128,7 @@ if has_config("build_tests") then
         add_files("tests/test_last_will.cpp")
         add_files("tests/test_phase3.cpp")
         add_files("tests/test_review_fixes.cpp")
+        add_files("tests/test_refactor_v2.cpp")
         if is_plat("linux") then
             add_syslinks("pthread", "rt")
         elseif is_plat("macosx") then
@@ -124,7 +140,7 @@ if has_config("build_tests") then
 end
 
 -- ---- 示例程序 ----
-if has_config("build_examples") then
+if want_examples then
     target("example_pub_sub")
         set_kind("binary")
         add_deps("embedmq")
@@ -155,7 +171,7 @@ if has_config("build_examples") then
 end
 
 -- ---- 性能基准测试 ----
-if has_config("build_bench") then
+if want_bench then
     target("emq_bench")
         set_kind("binary")
         add_deps("embedmq")

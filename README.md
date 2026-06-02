@@ -6,7 +6,7 @@
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)]()
 [![Build](https://img.shields.io/badge/build-xmake-green)]()
 [![Phase](https://img.shields.io/badge/phase-3%20done-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-180%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-2220%20passed-brightgreen)]()
 
 ---
 
@@ -70,7 +70,7 @@ xmake run example_req_rep
 ### 运行单元测试
 
 ```bash
-# 运行全部测试（9 个模块，180 个断言）
+# 运行全部测试（10 个模块，2220 个断言）
 xmake run emq_tests
 
 # 运行指定模块
@@ -368,7 +368,7 @@ auto p = embedmq::Participant::create(cfg);
 
 ### 零拷贝 scatter/gather
 
-BestEffort（QoS 0）发布路径使用 `encodeHeader` 仅生成 40 字节线缆头，配合 `sendmsg`/`WSASendTo` 的 iovec 分片发送 `{header, topic, payload}`，避免将载荷再拷贝进单一缓冲。
+BestEffort（QoS 0）发布路径使用 `encodeHeader` 仅生成紧凑线缆头（协议 v2：基础 26 字节 + 可选 timestamp/CRC），配合 `sendmsg`/`WSASendTo` 的 iovec 分片发送 `{header, topic, payload}`，避免将载荷再拷贝进单一缓冲。
 
 ### 内存池与无锁队列
 
@@ -497,7 +497,7 @@ xmake run emq_bench
 
 ## 测试覆盖
 
-> **平台：** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **总计：180 assertions，全部通过**
+> **平台：** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **总计：2220 assertions / 72 tests，全部通过**
 
 | 测试套件 | 覆盖内容 | 断言数 |
 |---------|---------|--------|
@@ -510,6 +510,7 @@ xmake run emq_bench
 | `test_last_will` | 超时触发遗嘱、优雅退出丢弃、本地投递、保留遗嘱 | 15 |
 | `test_phase3` | 内存池、无锁 MPSC、CPU 亲和性、共享内存收发、零拷贝编码 | 49 |
 | `test_review_fixes` | 编解码加固、时间轮长定时器/取消、对端更新、无服务请求不挂起 | 15 |
+| `test_refactor_v2` | Payload SBO、协议 v2 小端/紧凑头/可选 CRC、QoS2 滑动窗口与握手 | ~2040 |
 
 ---
 
@@ -527,4 +528,4 @@ MIT License — 详见 [LICENSE](LICENSE) 文件。
 
 ---
 
-*EmbedMQ v0.3.0 — Phase 1 + Phase 2 + Phase 3 已实现*
+*EmbedMQ v0.4.0 — Phase 1 + Phase 2 + Phase 3 已实现；协议 v2（紧凑头/显式小端/可选 CRC）、QoS2 完整状态机、TLV 发现、嵌入式构建 profile 已落地*

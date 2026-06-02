@@ -5,17 +5,21 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <unordered_map>
-#include <unordered_set>
 #include <optional>
 
 namespace embedmq {
 
-/// QoS 引擎：管理消息确认、重传和去重
+/// QoS 引擎：管理消息确认/重传、QoS2 两阶段握手与滑动去重窗口。
+///
+/// QoS2 状态机（MQTT 风格）：
+///   发送方 PUBLISH ──(重传至 PUBREC)──▶ 收 PUBREC ─▶ 发 PUBREL（重传至 PUBCOMP）─▶ 收 PUBCOMP 完成
+///   接收方 收 PUBLISH ─▶ 去重并投递 + 发 PUBREC；收 PUBREL ─▶ 发 PUBCOMP
+/// PUBLISH 阶段挂起在 pending_；PUBREL 阶段挂起在 pendingRel_，二者均参与超时重传。
 class QoSEngine {
 public:
-    using AckCallback  = std::function<void(uint32_t seqId)>;
     using SendCallback = std::function<void(const std::vector<uint8_t>& data)>;
 
     struct PendingMsg {
@@ -23,61 +27,110 @@ public:
         std::vector<uint8_t> data;
         std::chrono::steady_clock::time_point lastSent;
         uint32_t             retryCount{0};
-        uint32_t             maxRetries;
-        uint32_t             retryIntervalMs;
-        QoSLevel             qosLevel;
+        uint32_t             maxRetries{0};
+        uint32_t             retryIntervalMs{0};
+        QoSLevel             qosLevel{QoSLevel::BestEffort};
         SendCallback         resend;
     };
+
+    // ---- 发送方：PUBLISH 挂起 ----
+    bool addPending(uint32_t seqId, std::vector<uint8_t> data,
+                    const QoSProfile& qos, SendCallback resend) {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        pending_[seqId] = make(seqId, std::move(data), qos, std::move(resend));
+        return true;
+    }
 
     void onAck(uint32_t seqId) {
         std::lock_guard<std::mutex> lock(pendingMutex_);
         pending_.erase(seqId);
-        EMQ_LOG_D("QoSEngine", "ACK received seqId=%u", seqId);
     }
 
     void onNack(uint32_t seqId) {
         std::lock_guard<std::mutex> lock(pendingMutex_);
         auto it = pending_.find(seqId);
-        if (it != pending_.end()) {
-            retry(it->second);
-        }
+        if (it != pending_.end()) retry(it->second);
     }
 
-    /// 注册待确认消息（QoS 1/2）
-    bool addPending(uint32_t seqId,
-                    std::vector<uint8_t> data,
-                    const QoSProfile& qos,
-                    SendCallback resend)
-    {
+    // QoS2 发送方收到 PUBREC：停止 PUBLISH 重传。返回该 PUBLISH 是否处于挂起态。
+    bool onPubrec(uint32_t seqId) {
         std::lock_guard<std::mutex> lock(pendingMutex_);
-        PendingMsg pm;
-        pm.seqId          = seqId;
-        pm.data           = std::move(data);
-        pm.lastSent       = std::chrono::steady_clock::now();
-        pm.maxRetries     = qos.maxRetries;
-        pm.retryIntervalMs = qos.retryIntervalMs;
-        pm.qosLevel       = qos.level;
-        pm.resend         = std::move(resend);
-        pending_[seqId]   = std::move(pm);
-        return true;
+        return pending_.erase(seqId) > 0;
     }
 
-    /// 检查并重传超时消息，返回已放弃的 seqId 列表
+    // QoS2 发送方发出 PUBREL 后登记其重传（直到收到 PUBCOMP）
+    void addPendingRel(uint32_t seqId, std::vector<uint8_t> data,
+                       const QoSProfile& qos, SendCallback resend) {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        pendingRel_[seqId] = make(seqId, std::move(data), qos, std::move(resend));
+    }
+
+    // QoS2 发送方收到 PUBCOMP：握手完成
+    void onPubcomp(uint32_t seqId) {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        pendingRel_.erase(seqId);
+    }
+
+    /// 检查并重传超时消息（PUBLISH 与 PUBREL 两阶段），返回已放弃的 seqId 列表
     std::vector<uint32_t> processTimeouts() {
         std::vector<uint32_t> abandoned;
         auto now = std::chrono::steady_clock::now();
-
         std::lock_guard<std::mutex> lock(pendingMutex_);
-        for (auto it = pending_.begin(); it != pending_.end(); ) {
+        sweep(pending_,    now, abandoned);
+        sweep(pendingRel_, now, abandoned);
+        return abandoned;
+    }
+
+    // ---- 接收方：QoS2 滑动去重窗口 ----
+    // 仅对“是否重复投递”给出判定，内存按窗口大小有界（不再无界增长）。
+    bool isDuplicate(uint16_t sourceId, uint32_t seqId) {
+        std::lock_guard<std::mutex> lock(dedupMutex_);
+        return windows_[sourceId].checkAndMark(seqId);
+    }
+
+    // 滑动窗口自维护，无需周期清空；保留以兼容调用方。
+    void cleanupDedupWindow(size_t /*maxSize*/ = 0) {}
+
+    size_t pendingCount() const {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        return pending_.size();
+    }
+    size_t pendingRelCount() const {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        return pendingRel_.size();
+    }
+
+private:
+    PendingMsg make(uint32_t seqId, std::vector<uint8_t> data,
+                    const QoSProfile& qos, SendCallback resend) {
+        PendingMsg pm;
+        pm.seqId           = seqId;
+        pm.data            = std::move(data);
+        pm.lastSent        = std::chrono::steady_clock::now();
+        pm.maxRetries      = qos.maxRetries;
+        pm.retryIntervalMs = qos.retryIntervalMs;
+        pm.qosLevel        = qos.level;
+        pm.resend          = std::move(resend);
+        return pm;
+    }
+
+    void retry(PendingMsg& pm) {
+        pm.retryCount++;
+        pm.lastSent = std::chrono::steady_clock::now();
+        if (pm.resend) pm.resend(pm.data);
+    }
+
+    void sweep(std::unordered_map<uint32_t, PendingMsg>& m,
+               std::chrono::steady_clock::time_point now,
+               std::vector<uint32_t>& abandoned) {
+        for (auto it = m.begin(); it != m.end(); ) {
             auto& pm = it->second;
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - pm.lastSent).count();
             if (elapsed >= static_cast<long long>(pm.retryIntervalMs)) {
                 if (pm.retryCount >= pm.maxRetries) {
-                    EMQ_LOG_W("QoSEngine", "Abandon msg seqId=%u after %u retries",
-                              pm.seqId, pm.retryCount);
                     abandoned.push_back(pm.seqId);
-                    it = pending_.erase(it);
+                    it = m.erase(it);
                 } else {
                     retry(pm);
                     ++it;
@@ -86,42 +139,35 @@ public:
                 ++it;
             }
         }
-        return abandoned;
     }
 
-    // ---- QoS 2 去重 ----
-    bool isDuplicate(uint16_t sourceId, uint32_t seqId) {
-        std::lock_guard<std::mutex> lock(dedupMutex_);
-        auto key = (static_cast<uint64_t>(sourceId) << 32) | seqId;
-        return !received_.insert(key).second;
-    }
+    // 每个 source 维护一个有界滑动去重窗口
+    struct DedupWindow {
+        static constexpr uint32_t WINDOW = 1024;
+        bool     hasAny{false};
+        uint32_t highWater{0};
+        std::map<uint32_t, char> recent; // 有序，便于按下界滑动淘汰
 
-    void cleanupDedupWindow(size_t maxSize = 10000) {
-        std::lock_guard<std::mutex> lock(dedupMutex_);
-        if (received_.size() > maxSize) {
-            received_.clear(); // 简化：生产环境应使用滑动窗口
+        bool checkAndMark(uint32_t seq) {
+            if (!hasAny) { hasAny = true; highWater = seq; recent[seq] = 1; return false; }
+            if (seq < highWater && (highWater - seq) >= WINDOW)
+                return true;                       // 太旧：视为已处理（重复）
+            if (!recent.emplace(seq, 1).second)
+                return true;                       // 窗口内已存在
+            if (seq > highWater) highWater = seq;
+            uint32_t low = (highWater >= WINDOW) ? (highWater - WINDOW) : 0;
+            while (!recent.empty() && recent.begin()->first < low)
+                recent.erase(recent.begin());
+            return false;
         }
-    }
+    };
 
-    size_t pendingCount() const {
-        std::lock_guard<std::mutex> lock(pendingMutex_);
-        return pending_.size();
-    }
+    mutable std::mutex                       pendingMutex_;
+    std::unordered_map<uint32_t, PendingMsg> pending_;
+    std::unordered_map<uint32_t, PendingMsg> pendingRel_;
 
-private:
-    void retry(PendingMsg& pm) {
-        pm.retryCount++;
-        pm.lastSent = std::chrono::steady_clock::now();
-        EMQ_LOG_D("QoSEngine", "Retry seqId=%u (attempt %u/%u)",
-                  pm.seqId, pm.retryCount, pm.maxRetries);
-        if (pm.resend) pm.resend(pm.data);
-    }
-
-    mutable std::mutex                         pendingMutex_;
-    std::unordered_map<uint32_t, PendingMsg>   pending_;
-
-    mutable std::mutex           dedupMutex_;
-    std::unordered_set<uint64_t> received_;
+    mutable std::mutex                        dedupMutex_;
+    std::unordered_map<uint16_t, DedupWindow> windows_;
 };
 
 } // namespace embedmq

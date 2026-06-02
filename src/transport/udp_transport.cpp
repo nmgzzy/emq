@@ -44,6 +44,13 @@ void UdpTransport::parseConfig(const std::string& cfg) {
     }
     std::string me = extract("multicast_enabled");
     if (!me.empty()) multicastEnabled_ = (me != "0");
+    std::string rb = extract("udp_recv_buffer_size");
+    if (!rb.empty()) {
+        try {
+            uint32_t v = static_cast<uint32_t>(std::stoul(rb));
+            if (v >= 64) recvBufferSize_ = v; // 设下界，避免连固定头都放不下
+        } catch (...) {}
+    }
 }
 
 bool UdpTransport::init(const std::string& config) {
@@ -81,6 +88,23 @@ bool UdpTransport::init(const std::string& config) {
         }
     }
 
+    recvBuf_.resize(recvBufferSize_);
+
+#if defined(EMQ_PLATFORM_LINUX)
+    // 线程收敛：UDP 接收接入 epoll 反应堆，取代 select() 的 1024 fd 限制与定时轮询。
+    eventLoop_ = platform::EventLoop::create();
+    if (eventLoop_) {
+        auto cb = [this](platform::IoHandle h, platform::IoEvent) {
+            processFd(static_cast<SockFd>(platform::fromIoHandle(h)));
+        };
+        eventLoop_->addHandle(platform::toIoHandle(unicastFd_),
+                              platform::IoEvent::Readable, cb);
+        if (multicastFd_ != INVALID_SOCK)
+            eventLoop_->addHandle(platform::toIoHandle(multicastFd_),
+                                  platform::IoEvent::Readable, cb);
+    }
+#endif
+
     active_ = true;
     recvThread_ = std::thread([this]() { recvLoop(); });
     EMQ_LOG_I("UDP", "Initialized on port %u, multicast=%s:%u",
@@ -90,7 +114,15 @@ bool UdpTransport::init(const std::string& config) {
 
 void UdpTransport::shutdown() {
     if (active_.exchange(false)) {
+        if (eventLoop_) eventLoop_->wakeup();
         if (recvThread_.joinable()) recvThread_.join();
+        if (eventLoop_) {
+            if (unicastFd_   != INVALID_SOCK)
+                eventLoop_->removeHandle(platform::toIoHandle(unicastFd_));
+            if (multicastFd_ != INVALID_SOCK)
+                eventLoop_->removeHandle(platform::toIoHandle(multicastFd_));
+            eventLoop_.reset();
+        }
         if (unicastFd_   != INVALID_SOCK) platform::SocketApi::close(unicastFd_);
         if (multicastFd_ != INVALID_SOCK) platform::SocketApi::close(multicastFd_);
         unicastFd_   = INVALID_SOCK;
@@ -148,11 +180,35 @@ std::vector<Endpoint> UdpTransport::localEndpoints() const {
     return {ep};
 }
 
-void UdpTransport::recvLoop() {
-    constexpr int BUFSIZE = 65536;
-    std::vector<uint8_t> buf(BUFSIZE);
+void UdpTransport::processFd(SockFd fd) {
+    std::string srcIp;
+    uint16_t    srcPort = 0;
+    int n = platform::SocketApi::recvFrom(fd, recvBuf_.data(),
+                                          static_cast<int>(recvBuf_.size()),
+                                          srcIp, srcPort);
+    if (n > 0) {
+        Endpoint from;
+        from.address       = srcIp;
+        from.port          = srcPort;
+        from.transportType = "udp";
+        TransportRecvCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cb = recvCb_;
+        }
+        if (cb) cb(from, recvBuf_.data(), static_cast<size_t>(n));
+    }
+}
 
-    // 使用 select() 等待两个 socket 上的数据
+void UdpTransport::recvLoop() {
+#if defined(EMQ_PLATFORM_LINUX)
+    // epoll 反应堆：runOnce 带 100ms 超时，关停时由 wakeup() + active_ 立即退出
+    if (eventLoop_) {
+        while (active_) eventLoop_->runOnce(100);
+        return;
+    }
+#endif
+    // 非 Linux（或无事件循环）回退：select() 等待两个 socket
     while (active_) {
         fd_set fds;
         FD_ZERO(&fds);
@@ -173,27 +229,8 @@ void UdpTransport::recvLoop() {
         int ret = ::select(static_cast<int>(maxFd + 1), &fds, nullptr, nullptr, &tv);
         if (ret <= 0) continue;
 
-        auto process = [&](SockFd fd) {
-            std::string srcIp;
-            uint16_t    srcPort = 0;
-            int n = platform::SocketApi::recvFrom(fd, buf.data(), BUFSIZE,
-                                                   srcIp, srcPort);
-            if (n > 0) {
-                Endpoint from;
-                from.address       = srcIp;
-                from.port          = srcPort;
-                from.transportType = "udp";
-                TransportRecvCallback cb;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    cb = recvCb_;
-                }
-                if (cb) cb(from, buf.data(), static_cast<size_t>(n));
-            }
-        };
-
-        if (unicastFd_   != INVALID_SOCK && FD_ISSET(unicastFd_,   &fds)) process(unicastFd_);
-        if (multicastFd_ != INVALID_SOCK && FD_ISSET(multicastFd_, &fds)) process(multicastFd_);
+        if (unicastFd_   != INVALID_SOCK && FD_ISSET(unicastFd_,   &fds)) processFd(unicastFd_);
+        if (multicastFd_ != INVALID_SOCK && FD_ISSET(multicastFd_, &fds)) processFd(multicastFd_);
     }
 }
 

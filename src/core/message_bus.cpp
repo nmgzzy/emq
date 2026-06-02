@@ -1,5 +1,6 @@
 #include "message_bus.h"
 #include "../transport/transport_manager.h"
+#include "../platform/process.h"
 #include "../util/logger.h"
 
 namespace embedmq {
@@ -120,8 +121,35 @@ uint64_t           Replier::requestCount() const { return impl_->state->reqCount
 // ===================== MessageBus =====================
 
 MessageBus::MessageBus(uint16_t nodeId, TransportManager* tm)
-    : nodeId_(nodeId), transportMgr_(tm)
+    : nodeId_(nodeId), transportMgr_(tm), localHostName_(platform::getHostName())
 {}
+
+Endpoint MessageBus::selectEndpoint(const PeerInfo& peer) const {
+    const Endpoint* shm = nullptr;
+    const Endpoint* tcp = nullptr;
+    const Endpoint* udp = nullptr;
+    for (const auto& ep : peer.endpoints) {
+        if      (ep.transportType == "shm" && !shm) shm = &ep;
+        else if (ep.transportType == "tcp" && !tcp) tcp = &ep;
+        else if (ep.transportType == "udp" && !udp) udp = &ep;
+    }
+
+    if (transportMgr_) {
+        // SHM 仅在「同主机」且本地 SHM 传输可用时选用：跨主机段名指向的是本地的
+        // 另一段（无人消费），会静默丢消息，故必须用主机名作硬性约束。
+        if (shm && !shm->address.empty() &&
+            !localHostName_.empty() && peer.hostName == localHostName_ &&
+            transportMgr_->isActive("shm")) {
+            return *shm;
+        }
+        // TCP 可路由（地址已由发现层用收包来源 IP 补全），优于无连接的 UDP。
+        if (tcp && !tcp->address.empty() && transportMgr_->isActive("tcp")) {
+            return *tcp;
+        }
+    }
+    if (udp) return *udp;
+    return peer.endpoints.empty() ? Endpoint{} : peer.endpoints.front();
+}
 
 MessageBus::~MessageBus() { stop(); }
 
@@ -290,7 +318,7 @@ bool MessageBus::publish(const std::string& topic,
                 if (TopicRouter::matchWildcard(subTopic, topic) ||
                     subTopic == topic) {
                     if (!peer.endpoints.empty())
-                        targets.push_back(peer.endpoints.front());
+                        targets.push_back(selectEndpoint(peer));
                     break;
                 }
             }
@@ -304,7 +332,7 @@ bool MessageBus::publish(const std::string& topic,
             // 可靠传输：需保留完整缓冲以便重传
             auto data = MessageCodec::encode(
                 MessageType::PUBLISH, nodeId_, 0xFFFF,
-                topic, payload, qos, epSeqId, 0, flags);
+                topic, payload, qos, epSeqId, 0, flags, 0, crcEnabled_);
             if (transportMgr_) transportMgr_->send(ep, data.data(), data.size());
             qosEngine_.addPending(epSeqId, data, qos,
                 [this, ep](const std::vector<uint8_t>& d) {
@@ -315,7 +343,7 @@ bool MessageBus::publish(const std::string& topic,
             // BestEffort：零拷贝 scatter/gather 发送 {header, topic, payload}
             auto header = MessageCodec::encodeHeader(
                 MessageType::PUBLISH, nodeId_, 0xFFFF,
-                topic, payload, qos, epSeqId, 0, flags);
+                topic, payload, qos, epSeqId, 0, flags, 0, crcEnabled_);
             IoSlice slices[3];
             int n = 0;
             slices[n++] = IoSlice{ header.data(), header.size() };
@@ -352,12 +380,41 @@ void MessageBus::onReceived(const Endpoint& from,
         return;
     }
 
-    // QoS 1: 发送 ACK
-    if (qosLevel >= QoSLevel::Reliable && msgType == MessageType::PUBLISH) {
-        sendAck(from, result.header.sequenceId);
+    // ---- QoS2 两阶段握手控制包 ----
+    if (msgType == MessageType::PUBREC) {
+        // 发送方：停止 PUBLISH 重传，转入 PUBREL 阶段（重传至 PUBCOMP）
+        qosEngine_.onPubrec(result.header.sequenceId);
+        QoSProfile relQos = QoSProfile::exactlyOnce();
+        auto rel = MessageCodec::encode(MessageType::PUBREL, nodeId_, 0, "",
+            Payload{}, relQos, result.header.sequenceId, 0, 0, 0, crcEnabled_);
+        if (transportMgr_) transportMgr_->send(from, rel.data(), rel.size());
+        Endpoint ep = from;
+        uint32_t seq = result.header.sequenceId;
+        qosEngine_.addPendingRel(seq, rel, relQos,
+            [this, ep](const std::vector<uint8_t>& d) {
+                if (transportMgr_) transportMgr_->send(ep, d.data(), d.size());
+            });
+        return;
+    }
+    if (msgType == MessageType::PUBREL) {
+        // 接收方：回 PUBCOMP，完成握手
+        sendCtrl(from, MessageType::PUBCOMP, result.header.sequenceId);
+        return;
+    }
+    if (msgType == MessageType::PUBCOMP) {
+        qosEngine_.onPubcomp(result.header.sequenceId);
+        return;
     }
 
-    // QoS 2: 去重
+    // QoS1: 回 ACK；QoS2: 回 PUBREC（进入握手）
+    if (msgType == MessageType::PUBLISH) {
+        if (qosLevel == QoSLevel::ExactlyOnce)
+            sendCtrl(from, MessageType::PUBREC, result.header.sequenceId);
+        else if (qosLevel == QoSLevel::Reliable)
+            sendAck(from, result.header.sequenceId);
+    }
+
+    // QoS2: 去重（保证仅投递一次）
     if (qosLevel == QoSLevel::ExactlyOnce) {
         if (qosEngine_.isDuplicate(result.header.sourceId,
                                     result.header.sequenceId)) {
@@ -483,14 +540,21 @@ void MessageBus::deliverWill(const std::string& topic, const Payload& payload,
 void MessageBus::sendAck(const Endpoint& to, uint32_t seqId) {
     QoSProfile qos;
     auto data = MessageCodec::encode(
-        MessageType::ACK, nodeId_, 0, "", Payload{}, qos, seqId);
+        MessageType::ACK, nodeId_, 0, "", Payload{}, qos, seqId, 0, 0, 0, crcEnabled_);
     if (transportMgr_) transportMgr_->send(to, data.data(), data.size());
 }
 
 void MessageBus::sendNack(const Endpoint& to, uint32_t seqId) {
     QoSProfile qos;
     auto data = MessageCodec::encode(
-        MessageType::NACK, nodeId_, 0, "", Payload{}, qos, seqId);
+        MessageType::NACK, nodeId_, 0, "", Payload{}, qos, seqId, 0, 0, 0, crcEnabled_);
+    if (transportMgr_) transportMgr_->send(to, data.data(), data.size());
+}
+
+void MessageBus::sendCtrl(const Endpoint& to, MessageType type, uint32_t seqId) {
+    QoSProfile qos;
+    auto data = MessageCodec::encode(
+        type, nodeId_, 0, "", Payload{}, qos, seqId, 0, 0, 0, crcEnabled_);
     if (transportMgr_) transportMgr_->send(to, data.data(), data.size());
 }
 
@@ -499,7 +563,7 @@ void MessageBus::sendReply(const Endpoint& to, uint32_t correlationId,
 {
     auto data = MessageCodec::encode(
         MessageType::REPLY, nodeId_, 0,
-        "", payload, qos, seqCounter_++, correlationId);
+        "", payload, qos, seqCounter_++, correlationId, 0, 0, crcEnabled_);
     if (transportMgr_) transportMgr_->send(to, data.data(), data.size());
 }
 
@@ -587,7 +651,7 @@ std::future<Payload> MessageBus::sendRequest(const std::string& service,
                 for (auto& t : peer.subscribedTopics) {
                     if (t == svcTopic) {
                         if (!peer.endpoints.empty())
-                            targets.push_back(peer.endpoints.front());
+                            targets.push_back(selectEndpoint(peer));
                         break;
                     }
                 }
@@ -598,7 +662,7 @@ std::future<Payload> MessageBus::sendRequest(const std::string& service,
             uint32_t seqId = seqCounter_++;
             auto data = MessageCodec::encode(
                 MessageType::REQUEST, nodeId_, 0xFFFF,
-                svcTopic, payload, qos, seqId, corrId);
+                svcTopic, payload, qos, seqId, corrId, 0, 0, crcEnabled_);
             for (auto& ep : targets) {
                 if (transportMgr_) transportMgr_->send(ep, data.data(), data.size());
             }

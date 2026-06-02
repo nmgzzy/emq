@@ -1,20 +1,26 @@
 #include "discovery_agent.h"
 #include "../transport/transport_manager.h"
 #include "../core/message_codec.h"
+#include "../platform/process.h"
 #include "../util/logger.h"
+#include <algorithm>
 #include <cstring>
 
 namespace embedmq {
 
-// Announce payload 格式（简化版）：
-// [2] participantId
-// [1] domainId
-// [64] nodeName (null-terminated)
-// [1] topicCount
-// topicCount * [1 role + 256 topicName]
+// Announce payload 格式（TLV / 变长，显式小端）：
+//   u16 nodeId
+//   u8  domainId
+//   u8  flags            (bit0 = hasWill)
+//   u8  nameLen ; [name]
+//   u8  hostLen ; [host]   // 用于同主机判定（SHM 仅在同主机可用）
+//   u8  topicCount ; 每项: u8 role(0x01=PUB,0x02=SUB), u16 topicLen, [topic]
+//   u8  endpointCount ; 每项: u8 typeLen,[type], u8 addrLen,[addr], u16 port
+//   if hasWill: u8 willQos, u8 willRetain, u16 willTopicLen,[willTopic],
+//               u32 willPayloadLen,[willPayload]
+// 相比旧的定长 64B 名 + 128B/topic，短字符串场景显著更省。
 
-static constexpr size_t ANNOUNCE_NODENAME_LEN = 64;
-static constexpr size_t ANNOUNCE_TOPIC_LEN    = 128;
+static constexpr uint8_t ROLE_SUB = 0x02;
 
 DiscoveryAgent::DiscoveryAgent(uint16_t nodeId,
                                 const std::string& nodeName,
@@ -69,16 +75,14 @@ void DiscoveryAgent::start() {
     // 立即发送一次 Announce
     sendAnnounce();
 
+    // 合并心跳：ANNOUNCE 周期性广播即兼任保活信标（接收方 addOrUpdate 刷新 lastSeen），
+    // 不再单独发送 HEARTBEAT，减少嵌入式无线链路上的冗余流量。
     announceTimerId_ = timerWheel_.addPeriodic(
         config_.discovery.announceIntervalMs,
         [this]() { sendAnnounce(); });
 
-    heartbeatTimerId_ = timerWheel_.addPeriodic(
-        config_.discovery.heartbeatIntervalMs,
-        [this]() { sendHeartbeat(); });
-
     timeoutTimerId_ = timerWheel_.addPeriodic(
-        config_.discovery.heartbeatIntervalMs,
+        config_.discovery.announceIntervalMs,
         [this]() { checkPeerTimeouts(); });
 }
 
@@ -89,8 +93,12 @@ void DiscoveryAgent::stop() {
 }
 
 void DiscoveryAgent::announceTopics(const std::vector<std::string>& topics) {
-    std::lock_guard<std::mutex> lock(topicMutex_);
-    localTopics_ = topics;
+    {
+        std::lock_guard<std::mutex> lock(topicMutex_);
+        localTopics_ = topics;
+    }
+    // 订阅集合变化时立即宣布，缩短对端建立路由的时延（稳定期仍按周期广播）
+    if (running_) sendAnnounce();
 }
 
 void DiscoveryAgent::sendFarewell() {
@@ -146,7 +154,19 @@ void DiscoveryAgent::onDiscoveryMessage(const Endpoint& from,
         PeerInfo peer;
         if (parseAnnouncePayload(result.payload.data(),
                                   result.payload.size(), peer)) {
-            peer.endpoints.push_back(from);
+            // 端点解析：UDP 以收包来源 from 为准（advertised 多为 0.0.0.0 不可路由）；
+            // TCP advertised 地址为 0.0.0.0 时用 from 的 IP 补全；SHM 段名直接采用。
+            std::vector<Endpoint> resolved;
+            resolved.push_back(from);
+            for (auto& e : peer.endpoints) {
+                if (e.transportType == "udp") continue; // 用 from 替代
+                Endpoint ep = e;
+                if (e.transportType == "tcp" &&
+                    (e.address == "0.0.0.0" || e.address.empty()))
+                    ep.address = from.address;
+                resolved.push_back(ep);
+            }
+            peer.endpoints = std::move(resolved);
             registry_.addOrUpdate(peer);
         }
         return;
@@ -164,133 +184,128 @@ void DiscoveryAgent::onDiscoveryMessage(const Endpoint& from,
 }
 
 std::vector<uint8_t> DiscoveryAgent::buildAnnouncePayload() const {
-    std::vector<uint8_t> buf;
+    std::vector<uint8_t> b;
+    auto putU16 = [&](uint16_t v) {
+        b.push_back(static_cast<uint8_t>(v & 0xFF));
+        b.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    };
+    auto putU32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) b.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+    };
+    auto putStr8 = [&](const std::string& s) {
+        size_t n = std::min<size_t>(s.size(), 0xFF);
+        b.push_back(static_cast<uint8_t>(n));
+        b.insert(b.end(), s.begin(), s.begin() + n);
+    };
+    auto putStr16 = [&](const std::string& s) {
+        size_t n = std::min<size_t>(s.size(), 0xFFFF);
+        putU16(static_cast<uint16_t>(n));
+        b.insert(b.end(), s.begin(), s.begin() + n);
+    };
 
-    // participantId (2 bytes)
-    buf.push_back(static_cast<uint8_t>(nodeId_ & 0xFF));
-    buf.push_back(static_cast<uint8_t>((nodeId_ >> 8) & 0xFF));
+    putU16(nodeId_);
+    b.push_back(config_.domainId);
 
-    // domainId (1 byte)
-    buf.push_back(config_.domainId);
+    const auto& will = config_.lastWill;
+    bool hasWill = will.enabled && !will.topic.empty();
+    b.push_back(hasWill ? 0x01 : 0x00);
 
-    // nodeName (ANNOUNCE_NODENAME_LEN bytes, null-padded)
-    buf.resize(buf.size() + ANNOUNCE_NODENAME_LEN, 0);
-    size_t copyLen = std::min(nodeName_.size(), ANNOUNCE_NODENAME_LEN - 1);
-    std::memcpy(buf.data() + 3, nodeName_.c_str(), copyLen);
+    putStr8(nodeName_);
+    putStr8(platform::getHostName()); // 主机名：供对端判定是否同主机（决定 SHM 可用性）
 
-    // topicCount (1 byte)
     std::vector<std::string> topics;
     {
         std::lock_guard<std::mutex> lock(topicMutex_);
         topics = localTopics_;
     }
     uint8_t topicCount = static_cast<uint8_t>(std::min<size_t>(topics.size(), 255));
-    buf.push_back(topicCount);
-
-    for (uint8_t i = 0; i < topicCount; i++) {
-        // role = 0x01 (PUBLISHER or SUBSCRIBER, simplified)
-        buf.push_back(0x01);
-        // topic name (ANNOUNCE_TOPIC_LEN bytes, null-padded)
-        size_t oldSize = buf.size();
-        buf.resize(oldSize + ANNOUNCE_TOPIC_LEN, 0);
-        size_t tlen = std::min(topics[i].size(), ANNOUNCE_TOPIC_LEN - 1);
-        std::memcpy(buf.data() + oldSize, topics[i].c_str(), tlen);
+    b.push_back(topicCount);
+    for (uint8_t i = 0; i < topicCount; ++i) {
+        b.push_back(ROLE_SUB);   // 仅订阅/服务端点会被宣布
+        putStr16(topics[i]);
     }
 
-    // ---- 遗嘱消息块（可选，追加在 topics 之后）----
-    const auto& will = config_.lastWill;
-    if (will.enabled && !will.topic.empty()) {
-        buf.push_back(0x01); // willFlag
-        buf.push_back(static_cast<uint8_t>(will.qos));
-        buf.push_back(will.retain ? 1 : 0);
-
-        uint16_t tlen = static_cast<uint16_t>(
-            std::min<size_t>(will.topic.size(), 0xFFFF));
-        uint32_t plen = static_cast<uint32_t>(will.payload.size());
-
-        buf.push_back(static_cast<uint8_t>(tlen & 0xFF));
-        buf.push_back(static_cast<uint8_t>((tlen >> 8) & 0xFF));
-        buf.push_back(static_cast<uint8_t>(plen & 0xFF));
-        buf.push_back(static_cast<uint8_t>((plen >> 8) & 0xFF));
-        buf.push_back(static_cast<uint8_t>((plen >> 16) & 0xFF));
-        buf.push_back(static_cast<uint8_t>((plen >> 24) & 0xFF));
-
-        buf.insert(buf.end(), will.topic.begin(), will.topic.begin() + tlen);
-        if (plen > 0) {
-            const uint8_t* pd = will.payload.data();
-            buf.insert(buf.end(), pd, pd + plen);
-        }
-    } else {
-        buf.push_back(0x00); // willFlag = 无遗嘱
+    // 本地端点列表（供对端按能力选择 SHM/TCP/UDP 数据面）
+    std::vector<Endpoint> eps;
+    if (transportMgr_) eps = transportMgr_->allLocalEndpoints();
+    uint8_t epCount = static_cast<uint8_t>(std::min<size_t>(eps.size(), 255));
+    b.push_back(epCount);
+    for (uint8_t i = 0; i < epCount; ++i) {
+        putStr8(eps[i].transportType);
+        putStr8(eps[i].address);
+        putU16(eps[i].port);
     }
 
-    return buf;
+    if (hasWill) {
+        b.push_back(static_cast<uint8_t>(will.qos));
+        b.push_back(will.retain ? 1 : 0);
+        putStr16(will.topic);
+        putU32(static_cast<uint32_t>(will.payload.size()));
+        const uint8_t* pd = will.payload.data();
+        if (pd) b.insert(b.end(), pd, pd + will.payload.size());
+    }
+    return b;
 }
+
+namespace {
+// 带边界检查的小端读取游标
+struct Reader {
+    const uint8_t* p; size_t size; size_t off{0}; bool ok{true};
+    bool need(size_t n) { if (off + n > size) { ok = false; return false; } return true; }
+    uint8_t  u8()  { if (!need(1)) return 0; return p[off++]; }
+    uint16_t u16() { if (!need(2)) return 0; uint16_t v = uint16_t(p[off]) | (uint16_t(p[off+1])<<8); off += 2; return v; }
+    uint32_t u32() { if (!need(4)) return 0; uint32_t v = 0; for (int i=0;i<4;i++) v |= uint32_t(p[off+i])<<(8*i); off += 4; return v; }
+    std::string str8()  { uint8_t n = u8();  if (!need(n)) return {}; std::string s(reinterpret_cast<const char*>(p+off), n); off += n; return s; }
+    std::string str16() { uint16_t n = u16(); if (!need(n)) return {}; std::string s(reinterpret_cast<const char*>(p+off), n); off += n; return s; }
+};
+} // namespace
 
 bool DiscoveryAgent::parseAnnouncePayload(const uint8_t* data, size_t size,
                                            PeerInfo& out) const
 {
-    size_t minSize = 2 + 1 + ANNOUNCE_NODENAME_LEN + 1;
-    if (size < minSize) return false;
+    Reader r{data, size};
+    out.id = r.u16();
+    uint8_t domainId = r.u8();
+    if (!r.ok || domainId != config_.domainId) return false;
+    uint8_t flags = r.u8();
+    bool hasWill = (flags & 0x01) != 0;
 
-    size_t offset = 0;
-    out.id = static_cast<uint16_t>(data[offset]) |
-             (static_cast<uint16_t>(data[offset+1]) << 8);
-    offset += 2;
+    out.name     = r.str8();
+    out.hostName = r.str8();
 
-    // domainId
-    uint8_t domainId = data[offset++];
-    if (domainId != config_.domainId) return false;
-
-    // nodeName
-    out.name = std::string(reinterpret_cast<const char*>(data + offset),
-                           strnlen(reinterpret_cast<const char*>(data + offset),
-                                   ANNOUNCE_NODENAME_LEN));
-    offset += ANNOUNCE_NODENAME_LEN;
-
-    if (offset >= size) return false;
-    uint8_t topicCount = data[offset++];
-
-    for (uint8_t i = 0; i < topicCount; i++) {
-        if (offset + 1 + ANNOUNCE_TOPIC_LEN > size) break;
-        // uint8_t role = data[offset];
-        offset++;
-        std::string topic(reinterpret_cast<const char*>(data + offset),
-                          strnlen(reinterpret_cast<const char*>(data + offset),
-                                  ANNOUNCE_TOPIC_LEN));
-        offset += ANNOUNCE_TOPIC_LEN;
-        out.subscribedTopics.push_back(topic);
-        out.publishedTopics.push_back(topic);
+    uint8_t topicCount = r.u8();
+    for (uint8_t i = 0; i < topicCount && r.ok; ++i) {
+        uint8_t role = r.u8();
+        std::string topic = r.str16();
+        if (!r.ok) break;
+        if (role == ROLE_SUB) out.subscribedTopics.push_back(topic);
+        else                  out.publishedTopics.push_back(topic);
     }
 
-    // ---- 解析遗嘱消息块（可选）----
-    if (offset < size) {
-        uint8_t willFlag = data[offset++];
-        if (willFlag == 0x01 && offset + 8 <= size) {
-            out.willQos    = data[offset++];
-            out.willRetain = (data[offset++] != 0);
-            uint16_t tlen  = static_cast<uint16_t>(data[offset]) |
-                             (static_cast<uint16_t>(data[offset+1]) << 8);
-            offset += 2;
-            uint32_t plen  = static_cast<uint32_t>(data[offset]) |
-                             (static_cast<uint32_t>(data[offset+1]) << 8) |
-                             (static_cast<uint32_t>(data[offset+2]) << 16) |
-                             (static_cast<uint32_t>(data[offset+3]) << 24);
-            offset += 4;
-            if (offset + tlen + plen <= size) {
-                out.willTopic.assign(
-                    reinterpret_cast<const char*>(data + offset), tlen);
-                offset += tlen;
-                if (plen > 0) {
-                    out.willPayload = Payload(data + offset, plen);
-                    offset += plen;
-                }
-                out.hasWill = true;
-            }
+    uint8_t epCount = r.u8();
+    for (uint8_t i = 0; i < epCount && r.ok; ++i) {
+        Endpoint ep;
+        ep.transportType = r.str8();
+        ep.address       = r.str8();
+        ep.port          = r.u16();
+        if (r.ok) out.endpoints.push_back(ep);
+    }
+
+    if (hasWill) {
+        uint8_t  q   = r.u8();
+        uint8_t  ret = r.u8();
+        std::string wt = r.str16();
+        uint32_t plen  = r.u32();
+        if (r.ok && r.need(plen)) {
+            out.willQos    = q;
+            out.willRetain = (ret != 0);
+            out.willTopic  = wt;
+            if (plen > 0) out.willPayload = Payload(data + r.off, plen);
+            out.hasWill = true;
         }
     }
 
-    return true;
+    return r.ok;
 }
 
 } // namespace embedmq

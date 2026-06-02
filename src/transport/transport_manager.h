@@ -36,6 +36,9 @@ public:
     ITransport* get(const std::string& name) const;
     std::vector<Endpoint> allLocalEndpoints() const;
 
+    /// 指定类型的传输是否已注册且处于活动状态（供数据面端点优选）
+    bool isActive(const std::string& name) const;
+
 private:
     std::unordered_map<std::string, std::shared_ptr<ITransport>> transports_;
     GlobalRecvCallback recvCb_;

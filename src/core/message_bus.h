@@ -42,6 +42,9 @@ public:
     void start(int cpuAffinity = -1);
     void stop();
 
+    // 线缆 CRC 开关（默认开启）。可信链路/高频小包可关闭以省 CPU。
+    void setChecksumEnabled(bool on) { crcEnabled_ = on; }
+
     // ---- Pub/Sub ----
     std::unique_ptr<Publisher>  createPublisher(const std::string& topic,
                                                 const QoSProfile& qos);
@@ -101,11 +104,18 @@ public:
 private:
     void sendAck(const Endpoint& to, uint32_t seqId);
     void sendNack(const Endpoint& to, uint32_t seqId);
+    // QoS2 两阶段握手控制包
+    void sendCtrl(const Endpoint& to, MessageType type, uint32_t seqId);
     void sendReply(const Endpoint& to, uint32_t correlationId,
                    const Payload& payload, const QoSProfile& qos);
 
+    // 在对端宣布的多个端点中按本地可用传输与能力优选数据面：
+    // SHM（仅同主机）> TCP > UDP。返回选定端点（无可用时返回首个/空端点）。
+    Endpoint selectEndpoint(const PeerInfo& peer) const;
+
     uint16_t nodeId_;
     TransportManager* transportMgr_;
+    std::string       localHostName_;
 
     TopicRouter    router_;
     QoSEngine      qosEngine_;
@@ -113,6 +123,7 @@ private:
     util::TimerWheel timerWheel_;
 
     std::atomic<uint32_t> seqCounter_{1};
+    std::atomic<bool>     crcEnabled_{true};
 
     // 等待中的 request：correlationId -> (promise + 截止时间)
     // 注意：请求用 correlationId 索引，与发布可靠消息用的 seqId 是不同命名空间，

@@ -2,6 +2,26 @@
 
 ---
 
+> ## ⚙️ 实现现状（v0.4）与协议版本——请先阅读
+>
+> 本设计文档同时记录“总体设计”与部分“路线图/aspirational”内容。**以下为 v0.4 代码实测现状**，
+> 当文档正文与此块不一致时，**以此块为准**（正文中较早的协议字段/时序描述属历史设计稿）。
+>
+> - **线缆协议 v2（`EMBEDMQ_VERSION = 2`）**：紧凑变长头——基础 **26 字节** + 可选
+>   `timestamp(8)`（仅数据包 PUBLISH/REQUEST/REPLY）+ 可选 `checksum(4)`（由 `hdrFlags` 标识）。
+>   所有字段**显式小端**读写（跨架构一致），不再 `memcpy` 打包结构体。正文 §6 中的 40 字节定长头为旧版（v1）。
+> - **CRC 可选**：`config.enableChecksum` 控制；解码依据 `hdrFlags` 自描述。
+> - **QoS2 完整状态机**：PUBLISH→PUBREC→PUBREL→PUBCOMP 两阶段握手 + **每 source 有界滑动去重窗口**。
+> - **发现 v2**：ANNOUNCE 为 **TLV/变长**，携带 endpoint 列表；**已合并心跳**——周期 ANNOUNCE 兼任保活，
+>   不再单独发送 HEARTBEAT，订阅变化时立即重播（正文 §7 的独立 HEARTBEAT 时序属旧设计）。
+> - **传输**：UDP 接收在 Linux 下接入 **epoll 反应堆**（替代 select）；UDP/TCP/SHM 均原生实现 `sendv`；
+>   SHM 增加 layout 版本/几何校验、失效段回收与 futex 唤醒。
+> - **构建画像**：`xmake f --profile=embedded` 瘦身（关闭 TCP/示例/基准/io_uring）；**TCP 默认关闭**。
+> - **保留（reserved）配置**：`enableLocalIpc`/`enableSerial`/`enableBle`/`serialDevice` 当前**未实现对应 Transport**，
+>   默认关闭，仅作占位（正文与配置示例中出现仅表意图，置位无效果）。
+
+---
+
 ## 目录
 
 1. [项目概述](#1-项目概述)
