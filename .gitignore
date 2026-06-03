@@ -2,6 +2,11 @@
 .xmake/
 build/
 
+# CMake
+build-cmake/
+cmake-build-*/
+CMakeUserPresets.json
+
 # MacOS Cache
 .DS_Store
 
