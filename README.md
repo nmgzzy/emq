@@ -300,7 +300,8 @@ embedmq/
 │
 ├── tools/                        # 命令行工具（Phase 5）
 │   ├── emqtop/main.cpp           # 监控/收发/诊断 CLI（emqtop）
-│   └── emq_stress/main.cpp       # 压力/稳定性测试（emq_stress）
+│   ├── emq_stress/main.cpp       # 压力/稳定性测试（emq_stress）
+│   └── measure_resources.sh      # 运行时资源占用采样脚本
 │
 ├── bench/
 │   └── bench_main.cpp            # 性能基准（emq_bench）
@@ -414,6 +415,32 @@ cfg.threading.cpuAffinity = 2;   // 将内部工作线程绑定到 2 号核心
 | 内存池 vs malloc | 约 1.06×（单线程）|
 
 > 运行 `xmake f -m release && xmake run emq_bench` 复现。具体数值随硬件而异。
+
+### 运行时资源占用（Linux x64, Release, 16 核实测）
+
+用 `tools/measure_resources.sh`（周期采样 `/proc/<pid>` + `/usr/bin/time -v` 交叉验证）
+测得几种典型运行场景的资源占用：
+
+| 场景 | 峰值 RSS | 线程 | FD | CPU |
+|------|---------|------|-----|-----|
+| 空闲·进程内节点（`emqtop sub --no-udp`）| **3.91 MB** | 3 | 24 | ~0% |
+| 空闲·网络节点（`emqtop monitor`，UDP+多播）| **3.99 MB** | 4 | 28 | ~0.5% |
+| 持续负载 soak（单流发布+订阅+订阅抖动）| **3.96 MB** | 4 | 24 | ~27%（≈0.27 核）|
+| 高并发（8 生产者 × 8 订阅者）| **4.06 MB** | 10 | 24 | ~803%（≈8 核）|
+
+二进制/库体积：`emqtop` ~275 KB、`libembedmq_c.so` ~292 KB、`libembedmq.a` ~629 KB。
+
+要点：
+
+- **内存极低且恒定**：无论空闲还是满负载，RSS 都稳定在 **~4 MB**，soak/churn 下无增长（无泄漏、无无界缓冲），嵌入式友好。
+- **线程模型清晰**：进程内节点 3 线程（主线程 + MessageBus 工作线程 + TimerWheel 定时器线程）；启用 UDP 再多 1 个 epoll 接收线程。高并发场景多出的线程来自**调用方**发起的生产者，而非库内部膨胀。
+- **CPU 随负载线性伸缩**：空闲近 0%；单流约 0.27 核；8 路并发可吃满 ~8 核，`shared_mutex` 路由路径无明显锁瓶颈。
+- **FD 占用小**：进程内 24、网络节点 28，远低于常见 1024 软上限。
+
+```bash
+# 复现（任意可执行）：
+tools/measure_resources.sh -i 0.5 -d 30 -- ./build/linux/x86_64/release/emq_stress soak -d 30
+```
 
 ---
 
