@@ -295,10 +295,12 @@ embedmq/
 ├── bindings/                     # 语言绑定（Phase 5）
 │   └── python/
 │       ├── embedmq.py            # Python ctypes 绑定（零依赖）
-│       └── example.py            # Python 自测 / 示例
+│       ├── example.py            # Python 自测 / 示例
+│       └── stress.py             # Python 压力/稳定性测试
 │
 ├── tools/                        # 命令行工具（Phase 5）
-│   └── emqtop/main.cpp           # 监控/收发/诊断 CLI（emqtop）
+│   ├── emqtop/main.cpp           # 监控/收发/诊断 CLI（emqtop）
+│   └── emq_stress/main.cpp       # 压力/稳定性测试（emq_stress）
 │
 ├── bench/
 │   └── bench_main.cpp            # 性能基准（emq_bench）
@@ -481,6 +483,27 @@ emqtop peers                        # 列出已发现对端
 
 # 通用选项：--name <n>  --domain <d>  --no-udp  --shm
 ```
+
+### 压力测试与稳定性测试
+
+C++（`emq_stress`）与 Python（`bindings/python/stress.py`）两套等价脚本，覆盖
+吞吐 / 扇出 / 多生产者并发 / 请求-响应负载 / 生命周期 churn / 混合 soak 六类场景；
+均走**进程内同步投递**，对计数做精确断言（零丢失），并报告吞吐、延迟与 RSS 变化。
+
+```bash
+# C++：一键自测全部场景（带阈值，返回 0/非0）
+xmake run emq_stress all
+xmake run emq_stress throughput -n 1000000 -p 64   # 单项，自定义条数/载荷
+xmake run emq_stress concurrent -t 8 -s 8 -d 5     # 8 生产者 x 8 订阅者，跑 5s
+xmake run emq_stress soak -d 30                    # 30s 混合 soak
+
+# Python：等价场景（需先 xmake build embedmq_c）
+python3 bindings/python/stress.py all
+python3 bindings/python/stress.py reqrep -t 4
+```
+
+参考自测结果（Linux x64, Release）：C++ 本地吞吐 ~11.6 M msg/s、Req/Rep 平均 ~2 µs；
+churn/soak 下 RSS 零增长，并发场景收发计数精确匹配。
 
 ---
 

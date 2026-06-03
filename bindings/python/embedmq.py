@@ -29,6 +29,7 @@ import ctypes
 import ctypes.util
 import os
 import sys
+import weakref
 from ctypes import (
     CFUNCTYPE, POINTER, Structure,
     c_char, c_char_p, c_int, c_size_t, c_uint8, c_uint16, c_uint32,
@@ -259,9 +260,12 @@ def _to_bytes(data) -> bytes:
 # ===================== 句柄包装 =====================
 
 class Publisher:
-    def __init__(self, handle: int, lib: ctypes.CDLL):
+    def __init__(self, handle: int, lib: ctypes.CDLL, participant=None):
         self._h = handle
         self._lib = lib
+        # 强引用 participant：保证底层 MessageBus 在本对象析构前一直有效，
+        # 杜绝「participant 先于 child 释放」导致的悬垂指针 / double free。
+        self._participant = participant
 
     def publish(self, data) -> None:
         """发布载荷（str/bytes）。失败抛出 EmbedMQError。"""
@@ -281,17 +285,19 @@ class Publisher:
         if self._h:
             self._lib.emq_publisher_destroy(self._h)
             self._h = 0
+            self._participant = None
 
     def __del__(self):
         self.close()
 
 
 class Subscriber:
-    def __init__(self, handle: int, lib: ctypes.CDLL, cb_holder):
+    def __init__(self, handle: int, lib: ctypes.CDLL, cb_holder, participant=None):
         self._h = handle
         self._lib = lib
         # 持有 ctypes 回调对象，防止被 GC（否则 C 端回调会野指针）
         self._cb_holder = cb_holder
+        self._participant = participant
 
     def pause(self) -> None:
         self._lib.emq_subscriber_pause(self._h)
@@ -308,15 +314,17 @@ class Subscriber:
             self._lib.emq_subscriber_destroy(self._h)
             self._h = 0
             self._cb_holder = None
+            self._participant = None
 
     def __del__(self):
         self.close()
 
 
 class Requester:
-    def __init__(self, handle: int, lib: ctypes.CDLL):
+    def __init__(self, handle: int, lib: ctypes.CDLL, participant=None):
         self._h = handle
         self._lib = lib
+        self._participant = participant
 
     def request(self, data, timeout_ms: int = 5000) -> Optional[bytes]:
         """同步请求。超时返回 None，否则返回响应 bytes。"""
@@ -346,16 +354,18 @@ class Requester:
         if self._h:
             self._lib.emq_requester_destroy(self._h)
             self._h = 0
+            self._participant = None
 
     def __del__(self):
         self.close()
 
 
 class Replier:
-    def __init__(self, handle: int, lib: ctypes.CDLL, cb_holder):
+    def __init__(self, handle: int, lib: ctypes.CDLL, cb_holder, participant=None):
         self._h = handle
         self._lib = lib
         self._cb_holder = cb_holder
+        self._participant = participant
 
     @property
     def request_count(self) -> int:
@@ -366,6 +376,7 @@ class Replier:
             self._lib.emq_replier_destroy(self._h)
             self._h = 0
             self._cb_holder = None
+            self._participant = None
 
     def __del__(self):
         self.close()
@@ -390,6 +401,13 @@ class Participant:
             raise EmbedMQError("创建 Participant 失败")
         # 持有所有回调 trampoline，避免被 GC
         self._peer_cb = None
+        # 弱引用跟踪所有子对象（pub/sub/req/rep）：close() 时先于自身释放它们，
+        # 避免底层 MessageBus 先被销毁而子对象析构时悬垂访问。
+        self._children = weakref.WeakSet()
+
+    def _track(self, child):
+        self._children.add(child)
+        return child
 
     # ---- 属性 ----
     @property
@@ -430,7 +448,7 @@ class Participant:
         h = self._lib.emq_publisher_create(self._h, topic.encode("utf-8"), int(qos))
         if not h:
             raise EmbedMQError("创建 Publisher 失败: %s" % topic)
-        return Publisher(h, self._lib)
+        return self._track(Publisher(h, self._lib, self))
 
     def create_subscriber(self, topic: str,
                           callback: Callable[[Message], None],
@@ -445,13 +463,13 @@ class Participant:
             self._h, topic.encode("utf-8"), int(qos), cb, None)
         if not h:
             raise EmbedMQError("创建 Subscriber 失败: %s" % topic)
-        return Subscriber(h, self._lib, cb)
+        return self._track(Subscriber(h, self._lib, cb, self))
 
     def create_requester(self, service: str, qos: int = QoS.RELIABLE) -> Requester:
         h = self._lib.emq_requester_create(self._h, service.encode("utf-8"), int(qos))
         if not h:
             raise EmbedMQError("创建 Requester 失败: %s" % service)
-        return Requester(h, self._lib)
+        return self._track(Requester(h, self._lib, self))
 
     def create_replier(self, service: str,
                        handler: Callable[[Message], object],
@@ -481,7 +499,7 @@ class Participant:
         h = lib.emq_replier_create(self._h, service.encode("utf-8"), int(qos), cb, None)
         if not h:
             raise EmbedMQError("创建 Replier 失败: %s" % service)
-        return Replier(h, lib, cb)
+        return self._track(Replier(h, lib, cb, self))
 
     # ---- 生命周期 ----
     def shutdown(self) -> None:
@@ -490,6 +508,14 @@ class Participant:
 
     def close(self) -> None:
         if self._h:
+            # 先释放所有仍存活的子对象（pub/sub/req/rep），再销毁参与者，
+            # 保证底层 MessageBus 仍有效，避免子对象悬垂析构。
+            for child in list(self._children):
+                try:
+                    child.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._children.clear()
             self._lib.emq_participant_destroy(self._h)
             self._h = 0
 

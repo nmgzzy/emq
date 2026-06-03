@@ -216,6 +216,21 @@ if want_tools then
             add_syslinks("ws2_32", "mswsock", "advapi32")
         end
         set_group("tools")
+
+    -- 压力 / 稳定性测试工具
+    target("emq_stress")
+        set_kind("binary")
+        add_deps("embedmq")
+        add_includedirs("include", "src")
+        add_files("tools/emq_stress/main.cpp")
+        if is_plat("linux") then
+            add_syslinks("pthread", "rt")
+        elseif is_plat("macosx") then
+            add_syslinks("pthread")
+        elseif is_plat("windows") then
+            add_syslinks("ws2_32", "mswsock", "advapi32")
+        end
+        set_group("tools")
 end
 
 -- ---- 性能基准测试 ----
