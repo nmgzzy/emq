@@ -1,5 +1,7 @@
 # EmbedMQ
 
+**[English](README.en.md)** | **简体中文**
+
 **跨平台轻量级通信中间件** | Embedded Message Queue / Middleware
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)]()
