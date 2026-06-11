@@ -104,6 +104,10 @@ public:
     void removeLocalSubscription(uint64_t subId);
     void removeServiceHandler(const std::string& service);
 
+    // 本地订阅/服务集合变化时回调（创建与销毁都会触发），由 Participant 接到
+    // discovery->announceTopics，使对端及时获知本地不再持有的 topic/service。
+    void setTopicsChangedCallback(std::function<void()> cb);
+
     // corrCounter_ 供 Requester 使用（通过 sendRequest 访问）
     std::atomic<uint32_t> corrCounter_{1};
 
@@ -144,6 +148,11 @@ private:
     // service handler 注册
     mutable std::mutex serviceMutex_;
     std::unordered_map<std::string, RequestHandler> serviceHandlers_;
+
+    // 本地 topic/service 集合变化通知（见 setTopicsChangedCallback）
+    std::mutex             topicsCbMutex_;
+    std::function<void()>  topicsChangedCb_;
+    void notifyTopicsChanged();
 
     // 对端信息 -> endpoint 映射
     std::mutex peerMutex_;

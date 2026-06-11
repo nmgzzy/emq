@@ -54,6 +54,12 @@ void Participant::Impl::init() {
     discovery = std::make_unique<DiscoveryAgent>(
         id, name, config, transportMgr.get());
 
+    // 本地订阅/服务集合变化（创建或销毁）时重新宣布，使对端及时停止向已无
+    // 本地处理者的 topic/service 发送（避免陈旧路由 → 浪费流量 / 请求超时）。
+    messageBus->setTopicsChangedCallback([this]() {
+        if (discovery) discovery->announceTopics(messageBus->localTopics());
+    });
+
     discovery->setOnPeerDiscovered([this](const PeerInfo& peer) {
         messageBus->onPeerDiscovered(peer);
         if (peerEventCb) peerEventCb(peer.id, peer.name, true);
@@ -177,6 +183,8 @@ void Participant::onPeerEvent(PeerEventCallback callback) {
 
 void Participant::shutdown() {
     if (impl_ && impl_->running.exchange(false)) {
+        // 先摘除变更回调，避免关停期间晚到的 Subscriber/Replier 析构再触发宣布
+        impl_->messageBus->setTopicsChangedCallback(nullptr);
         impl_->discovery->sendFarewell();
         impl_->discovery->stop();
         impl_->messageBus->stop();

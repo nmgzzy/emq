@@ -222,6 +222,13 @@ ShmTransport::Region* ShmTransport::openInbox(const std::string& name, bool crea
         if (h->magic != SHM_MAGIC)                  { closeRegion(r); return nullptr; }
         if (h->layoutVersion != SHM_LAYOUT_VERSION) { closeRegion(r); return nullptr; }
         if (h->slotCount == 0 || h->slotSize == 0)  { closeRegion(r); return nullptr; }
+        // 槽必须至少能容纳槽头，否则 (slotSize - sizeof(SlotHeader)) 在无符号下溢，
+        // 使长度上界检查形同虚设。
+        if (h->slotSize < sizeof(SlotHeader))       { closeRegion(r); return nullptr; }
+        // 防 slotCount*slotSize 溢出 size_t（32 位嵌入式目标尤甚）：溢出会让 need
+        // 回绕成小值绕过下面的容量检查，进而 slot 偏移越界。
+        if (static_cast<size_t>(h->slotCount) >
+            (SIZE_MAX - sizeof(ShmHeader)) / h->slotSize) { closeRegion(r); return nullptr; }
         // 校验映射大小能容纳声明的几何，防止越界
         size_t need = sizeof(ShmHeader) +
                       static_cast<size_t>(h->slotCount) * h->slotSize;
@@ -415,16 +422,20 @@ void ShmTransport::recvLoop() {
             uint32_t head = h->head.load(std::memory_order_acquire);
             if (tail == head) break; // 无新数据
 
+            // 用本地可信几何（slotCount_/slotSize_，inbox 由本进程创建并 clamp 过）
+            // 而非共享头里的 h->slotCount/h->slotSize：后者位于对端可写的共享内存，
+            // 被恶意/损坏对端改成 <sizeof(SlotHeader) 会让下方长度上界计算下溢，
+            // 从而把越界 len 拷进 slotSize_ 大小的 buf。
             uint8_t* slotPtr = reinterpret_cast<uint8_t*>(r->base) +
                                sizeof(ShmHeader) +
-                               static_cast<size_t>(tail % h->slotCount) * h->slotSize;
+                               static_cast<size_t>(tail % slotCount_) * slotSize_;
             auto* sh = reinterpret_cast<SlotHeader*>(slotPtr);
             if (sh->state.load(std::memory_order_acquire) != SLOT_READY) {
                 // 生产者已预留但尚未写完，稍后再试
                 break;
             }
             uint32_t len = sh->len;
-            if (len > h->slotSize - sizeof(SlotHeader)) len = 0;
+            if (len > slotSize_ - sizeof(SlotHeader)) len = 0;
             if (len > 0) {
                 std::memcpy(buf.data(), slotPtr + sizeof(SlotHeader), len);
             }

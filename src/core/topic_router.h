@@ -102,15 +102,17 @@ public:
 
         size_t pi = 0, ti = 0;
         while (pi < patParts.size() && ti < topParts.size()) {
-            if (patParts[pi] == "#") return true;
+            // '#' 仅在末段才作“匹配剩余全部”解释（MQTT 语义）。出现在中间段
+            // （如 a/#/b）不再被当作 match-all，避免过度投递。
+            if (patParts[pi] == "#") return pi + 1 == patParts.size();
             if (patParts[pi] == "*" || patParts[pi] == topParts[ti]) {
                 pi++; ti++;
             } else {
                 return false;
             }
         }
-        // '#' at end also matches zero remaining segments
-        if (pi < patParts.size() && patParts[pi] == "#") return true;
+        // 末段 '#' 也匹配“剩余零段”
+        if (pi + 1 == patParts.size() && patParts[pi] == "#") return true;
         return (pi == patParts.size() && ti == topParts.size());
     }
 

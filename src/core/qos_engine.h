@@ -85,11 +85,25 @@ public:
     // 仅对“是否重复投递”给出判定，内存按窗口大小有界（不再无界增长）。
     bool isDuplicate(uint16_t sourceId, uint32_t seqId) {
         std::lock_guard<std::mutex> lock(dedupMutex_);
-        return windows_[sourceId].checkAndMark(seqId);
+        auto& w = windows_[sourceId];
+        w.lastTouch = std::chrono::steady_clock::now();
+        return w.checkAndMark(seqId);
     }
 
-    // 滑动窗口自维护，无需周期清空；保留以兼容调用方。
-    void cleanupDedupWindow(size_t /*maxSize*/ = 0) {}
+    // 淘汰长时间无活动的 source 窗口，使 windows_ 内存有上界（即便 16 位 source
+    // 滚动也不至于积累到 64K 条目）。空闲窗口被移除；该 source 之后再出现时重建窗口，
+    // 最多导致一次跨窗口重复放行，可接受。
+    void cleanupDedupWindow(size_t /*maxSize*/ = 0) {
+        using namespace std::chrono;
+        auto now = steady_clock::now();
+        std::lock_guard<std::mutex> lock(dedupMutex_);
+        for (auto it = windows_.begin(); it != windows_.end(); ) {
+            if (now - it->second.lastTouch > seconds(DEDUP_IDLE_TTL_SEC))
+                it = windows_.erase(it);
+            else
+                ++it;
+        }
+    }
 
     size_t pendingCount() const {
         std::lock_guard<std::mutex> lock(pendingMutex_);
@@ -142,10 +156,13 @@ private:
     }
 
     // 每个 source 维护一个有界滑动去重窗口
+    static constexpr int DEDUP_IDLE_TTL_SEC = 30; // 窗口空闲多久后回收
+
     struct DedupWindow {
         static constexpr uint32_t WINDOW = 1024;
         bool     hasAny{false};
         uint32_t highWater{0};
+        std::chrono::steady_clock::time_point lastTouch{};
         std::map<uint32_t, char> recent; // 有序，便于按下界滑动淘汰
 
         bool checkAndMark(uint32_t seq) {

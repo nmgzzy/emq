@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <vector>
 #include <memory>
@@ -82,11 +83,15 @@ private:
     static constexpr uint64_t TAG_POOL     = 0;
     static constexpr uint64_t TAG_OVERSIZED= 0xEB0CEB0CEB0CEB0Cull;
 
+    // 用 memcpy 而非 reinterpret_cast<uint64_t*> 读写：后者违反严格别名
+    // （-O2 -fstrict-aliasing 下 UB，嵌入式工具链尤甚），且不依赖对齐。
     static void writeTag(uint8_t* raw, uint64_t tag) {
-        *reinterpret_cast<uint64_t*>(raw) = tag;
+        std::memcpy(raw, &tag, sizeof(tag));
     }
-    static uint64_t readTag(uint8_t* raw) {
-        return *reinterpret_cast<uint64_t*>(raw);
+    static uint64_t readTag(const uint8_t* raw) {
+        uint64_t tag;
+        std::memcpy(&tag, raw, sizeof(tag));
+        return tag;
     }
 
     void allocateChunkLocked(size_t blocks) {

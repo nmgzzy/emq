@@ -231,7 +231,9 @@ std::unique_ptr<Subscriber> MessageBus::createSubscriber(
         if (!s) return; // Subscriber 已销毁，安全跳过
         if (!s->paused.load()) {
             s->msgCount++;
-            cb(msg);
+            // 用户回调异常绝不能逃逸到传输/分发线程，否则纯 C/C++ 使用者会
+            // 越过库边界触发 std::terminate。
+            try { cb(msg); } catch (...) {}
         }
     }, qos);
     impl->subId = subId;
@@ -242,7 +244,7 @@ std::unique_ptr<Subscriber> MessageBus::createSubscriber(
         if (retained) {
             if (!impl->state->paused.load()) {
                 impl->state->msgCount++;
-                cb(*retained);
+                try { cb(*retained); } catch (...) {}
             }
         }
     }
@@ -274,7 +276,8 @@ std::unique_ptr<Replier> MessageBus::createReplier(
         serviceHandlers_[service] = [wstate, h = std::move(handler)](
             const ReceivedMessage& req) -> Payload {
             if (auto s = wstate.lock()) s->reqCount++;
-            return h(req);
+            // 服务处理器抛出的异常不得逃逸到传输线程；失败回退为空响应。
+            try { return h(req); } catch (...) { return Payload{}; }
         };
     }
 
@@ -477,6 +480,11 @@ void MessageBus::onReceived(const Endpoint& from,
     }
 
     if (msgType == MessageType::REPLY) {
+        // 可靠 REPLY：回 ACK 以停止 replier 重传（与 QoS1 PUBLISH 对称）。
+        // 即便是重复 REPLY 也回 ACK（幂等），以防先前的 ACK 在途中丢失。
+        if (qosLevel >= QoSLevel::Reliable)
+            sendAck(from, result.header.sequenceId);
+
         std::promise<Payload> p;
         bool found = false;
         {
@@ -564,10 +572,24 @@ void MessageBus::sendCtrl(const Endpoint& to, MessageType type, uint32_t seqId) 
 void MessageBus::sendReply(const Endpoint& to, uint32_t correlationId,
                             const Payload& payload, const QoSProfile& qos)
 {
+    uint32_t seqId = seqCounter_++;
     auto data = MessageCodec::encode(
         MessageType::REPLY, nodeId_, 0,
-        "", payload, qos, seqCounter_++, correlationId, 0, 0, crcEnabled_);
+        "", payload, qos, seqId, correlationId, 0, 0, crcEnabled_);
     if (transportMgr_) transportMgr_->send(to, data.data(), data.size());
+
+    // 可靠请求：REPLY 也必须可靠送达，否则丢失的 REPLY 只会让 requester 超时而不重试。
+    // 登记 REPLY 重传，直到 requester 回 ACK（ACK 携带本 seqId，由 onReceived 的
+    // ACK 分支经 qosEngine_.onAck 取消，与 QoS1 PUBLISH 完全对称）。处理器仅在首个
+    // REQUEST 时执行一次，丢失的是 REPLY——故重传 REPLY 即可，无需缓存响应或对
+    // REQUEST 去重。
+    if (qos.level >= QoSLevel::Reliable) {
+        Endpoint ep = to;
+        qosEngine_.addPending(seqId, data, qos,
+            [this, ep](const std::vector<uint8_t>& d) {
+                if (transportMgr_) transportMgr_->send(ep, d.data(), d.size());
+            });
+    }
 }
 
 std::vector<std::string> MessageBus::localTopics() const {
@@ -583,11 +605,29 @@ std::vector<std::string> MessageBus::localTopics() const {
 
 void MessageBus::removeLocalSubscription(uint64_t subId) {
     router_.removeSubscription(subId);
+    notifyTopicsChanged();
 }
 
 void MessageBus::removeServiceHandler(const std::string& service) {
-    std::lock_guard<std::mutex> lock(serviceMutex_);
-    serviceHandlers_.erase(service);
+    {
+        std::lock_guard<std::mutex> lock(serviceMutex_);
+        serviceHandlers_.erase(service);
+    }
+    notifyTopicsChanged();
+}
+
+void MessageBus::setTopicsChangedCallback(std::function<void()> cb) {
+    std::lock_guard<std::mutex> lock(topicsCbMutex_);
+    topicsChangedCb_ = std::move(cb);
+}
+
+void MessageBus::notifyTopicsChanged() {
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(topicsCbMutex_);
+        cb = topicsChangedCb_;
+    }
+    if (cb) cb();   // 锁外触发，避免在持锁状态下重入广播
 }
 
 void MessageBus::cancelPendingRequest(uint32_t corrId) {

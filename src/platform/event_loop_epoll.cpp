@@ -86,10 +86,17 @@ public:
                 if (it != handlers_.end()) cb = it->second.cb;
             }
             if (cb) {
-                IoEvent ev = IoEvent::Readable;
-                if (events[i].events & EPOLLOUT) ev = IoEvent::Writable;
-                if (events[i].events & (EPOLLERR | EPOLLHUP)) ev = IoEvent::Error;
-                cb(static_cast<IoHandle>(fd), ev);
+                // 合并而非覆盖：可读/可写/错误是各自独立的位标志（IoEvent 支持 |/&）。
+                // 半关闭连接常同时携带 EPOLLIN+EPOLLHUP——错误不得掩盖可读，
+                // 否则缓冲区里尚未读取的入站数据会被丢弃。错误时仍置可读，
+                // 让上层有机会把残留数据 drain 完。
+                uint8_t bits = 0;
+                if (events[i].events & EPOLLIN)  bits |= static_cast<uint8_t>(IoEvent::Readable);
+                if (events[i].events & EPOLLOUT) bits |= static_cast<uint8_t>(IoEvent::Writable);
+                if (events[i].events & (EPOLLERR | EPOLLHUP))
+                    bits |= static_cast<uint8_t>(IoEvent::Error) |
+                            static_cast<uint8_t>(IoEvent::Readable);
+                cb(static_cast<IoHandle>(fd), static_cast<IoEvent>(bits));
             }
         }
     }

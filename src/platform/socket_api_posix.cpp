@@ -82,7 +82,7 @@ bool SocketApi::joinMulticast(SockFd sock,
                                const std::string& group,
                                const std::string& /*iface*/) {
     ip_mreq mreq{};
-    ::inet_pton(AF_INET, group.c_str(), &mreq.imr_multiaddr);
+    if (::inet_pton(AF_INET, group.c_str(), &mreq.imr_multiaddr) != 1) return false;
     mreq.imr_interface.s_addr = INADDR_ANY;
     return ::setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                         &mreq, sizeof(mreq)) == 0;
@@ -92,7 +92,7 @@ bool SocketApi::leaveMulticast(SockFd sock,
                                 const std::string& group,
                                 const std::string& /*iface*/) {
     ip_mreq mreq{};
-    ::inet_pton(AF_INET, group.c_str(), &mreq.imr_multiaddr);
+    if (::inet_pton(AF_INET, group.c_str(), &mreq.imr_multiaddr) != 1) return false;
     mreq.imr_interface.s_addr = INADDR_ANY;
     return ::setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP,
                         &mreq, sizeof(mreq)) == 0;
@@ -101,7 +101,8 @@ bool SocketApi::leaveMulticast(SockFd sock,
 bool SocketApi::connect(SockFd sock, const std::string& ip, uint16_t port) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    ::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+    // inet_pton 返回 1 才有效；非法地址不再静默落到 0.0.0.0。
+    if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) return false;
     addr.sin_port = htons(port);
     return ::connect(sock, reinterpret_cast<sockaddr*>(&addr),
                      sizeof(addr)) == 0;
@@ -127,7 +128,7 @@ int SocketApi::sendTo(SockFd sock, const void* data, int len,
                       const std::string& ip, uint16_t port) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    ::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+    if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) return -1;
     addr.sin_port = htons(port);
     return static_cast<int>(::sendto(sock, data, len, 0,
                                      reinterpret_cast<sockaddr*>(&addr),
@@ -161,7 +162,7 @@ int SocketApi::sendToV(SockFd sock, const IoSlice* slices, int count,
                        const std::string& ip, uint16_t port) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    ::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+    if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) return -1;
     addr.sin_port = htons(port);
 
     iovec stackIov[kStackIovCount]{};

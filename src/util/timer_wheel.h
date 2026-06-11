@@ -52,6 +52,10 @@ public:
 
     void stop() {
         running_ = false;
+        // 序列化 stop()：owner::stop()、~owner、~TimerWheel 可能多次/并发调用，
+        // 不加锁的 joinable()+join() 会在并发下重复 join 同一线程（UB）。
+        // join 同时是“在飞回调已完成”的屏障——返回后保证无回调再触碰 owner 成员。
+        std::lock_guard<std::mutex> lk(stopMutex_);
         if (thread_.joinable()) thread_.join();
     }
 
@@ -142,6 +146,7 @@ private:
     std::vector<std::list<Timer>> slots_;
     std::unordered_set<TimerId>   cancelSet_;
     std::mutex         mutex_;
+    std::mutex         stopMutex_;
     uint64_t           curTick_{0};
     std::atomic<TimerId> nextId_{1};
     std::atomic<bool>  running_{false};

@@ -229,7 +229,8 @@ class Message:
         self.topic: str = c_msg.topic.decode("utf-8", "replace") if c_msg.topic else ""
         n = int(c_msg.payload_len)
         if c_msg.payload and n:
-            self.payload: bytes = bytes(bytearray(c_msg.payload[i] for i in range(n)))
+            # string_at 一次性拷贝，避免逐字节 Python 循环在大载荷下的 O(n) 慢路径
+            self.payload: bytes = ctypes.string_at(c_msg.payload, n)
         else:
             self.payload = b""
         self.timestamp = int(c_msg.timestamp)
@@ -279,7 +280,14 @@ class Publisher:
 
     @property
     def subscriber_count(self) -> int:
-        return max(0, int(self._lib.emq_publisher_subscriber_count(self._h)))
+        if not self._h:
+            raise EmbedMQError("publisher 已销毁")
+        rc = int(self._lib.emq_publisher_subscriber_count(self._h))
+        # 负值是错误码（如 EMQ_ERR_INVALID_ARG），不应静默当作 0
+        if rc < 0:
+            raise EmbedMQError("subscriber_count 失败: %s"
+                               % self._lib.emq_status_str(rc).decode())
+        return rc
 
     def close(self) -> None:
         if self._h:

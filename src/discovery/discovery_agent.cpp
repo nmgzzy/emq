@@ -251,7 +251,9 @@ namespace {
 // 带边界检查的小端读取游标
 struct Reader {
     const uint8_t* p; size_t size; size_t off{0}; bool ok{true};
-    bool need(size_t n) { if (off + n > size) { ok = false; return false; } return true; }
+    // 防溢出：用减法比较替代 off+n（off+n 在 32 位 size_t 上对攻击者可控的 n 会回绕，
+    // 绕过边界检查导致越界读——与 message_codec.h 的 64 位累加同样的防护意图）。
+    bool need(size_t n) { if (n > size || off > size - n) { ok = false; return false; } return true; }
     uint8_t  u8()  { if (!need(1)) return 0; return p[off++]; }
     uint16_t u16() { if (!need(2)) return 0; uint16_t v = uint16_t(p[off]) | (uint16_t(p[off+1])<<8); off += 2; return v; }
     uint32_t u32() { if (!need(4)) return 0; uint32_t v = 0; for (int i=0;i<4;i++) v |= uint32_t(p[off+i])<<(8*i); off += 4; return v; }

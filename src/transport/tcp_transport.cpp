@@ -45,6 +45,9 @@ void TcpTransport::shutdown() {
             platform::SocketApi::close(listenFd_);
             listenFd_ = INVALID_SOCK;
         }
+        // 关闭所有连接 fd 并清空表：这会让阻塞在 recv 的 clientLoop 立即返回。
+        // 由本处统一 close 并移除条目后，clientLoop 的 closeOwnedConnection 将
+        // 找不到匹配条目，从而不会重复 close（避免 fd 复用竞态）。
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (auto& [ep, fd] : connections_)
@@ -52,9 +55,21 @@ void TcpTransport::shutdown() {
             connections_.clear();
         }
         if (acceptThread_.joinable()) acceptThread_.join();
-        for (auto& t : clientThreads_)
-            if (t.joinable()) t.join();
+        // 等待所有（已 detach 的）client 线程退出后再返回，确保它们不再触碰 this。
+        std::unique_lock<std::mutex> lk(clientCvMutex_);
+        clientCv_.wait(lk, [this]() { return clientThreadCount_.load() == 0; });
     }
+}
+
+void TcpTransport::spawnClientThread(SockFd fd, const Endpoint& peerEp) {
+    clientThreadCount_.fetch_add(1, std::memory_order_acq_rel);
+    std::thread([this, fd, peerEp]() {
+        clientLoop(fd, peerEp);
+        if (clientThreadCount_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            std::lock_guard<std::mutex> lk(clientCvMutex_);
+            clientCv_.notify_all();
+        }
+    }).detach();
 }
 
 bool TcpTransport::sendAll(SockFd fd, const uint8_t* data, size_t size) {
@@ -80,10 +95,15 @@ bool TcpTransport::recvAll(SockFd fd, uint8_t* buf, size_t size) {
     return true;
 }
 
-void TcpTransport::removeConnection(const Endpoint& ep) {
+void TcpTransport::closeOwnedConnection(const Endpoint& ep, SockFd fd) {
     std::string key = ep.address + ":" + std::to_string(ep.port);
     std::lock_guard<std::mutex> lock(mutex_);
-    connections_.erase(key);
+    auto it = connections_.find(key);
+    if (it != connections_.end() && it->second == fd) {
+        platform::SocketApi::close(fd);   // 本线程仍“拥有”该 fd：唯一 close 点
+        connections_.erase(it);
+    }
+    // 否则该 fd 已被 shutdown() 关闭并移除，或已被新连接替换——不得再次 close
 }
 
 static inline void encodeLen(uint32_t len, uint8_t lenBuf[4]) {
@@ -169,9 +189,7 @@ void TcpTransport::acceptLoop() {
             connections_[peerIp + ":" + std::to_string(peerPort)] = clientFd;
         }
 
-        clientThreads_.emplace_back([this, clientFd, peerEp]() {
-            clientLoop(clientFd, peerEp);
-        });
+        spawnClientThread(clientFd, peerEp);
     }
 }
 
@@ -201,9 +219,8 @@ void TcpTransport::clientLoop(SockFd clientFd, const Endpoint& peerEp) {
         if (cb) cb(peerEp, buf.data(), msgLen);
     }
 
-    // 连接结束：关闭并从连接表移除，避免后续复用已失效的 fd
-    platform::SocketApi::close(clientFd);
-    removeConnection(peerEp);
+    // 连接结束：仅当本线程仍拥有该 fd 时关闭并移除（避免与 shutdown 重复 close）
+    closeOwnedConnection(peerEp, clientFd);
 }
 
 SockFd TcpTransport::getOrConnect(const Endpoint& ep) {
@@ -221,10 +238,7 @@ SockFd TcpTransport::getOrConnect(const Endpoint& ep) {
     }
     connections_[key] = fd;
 
-    Endpoint peerEp = ep;
-    clientThreads_.emplace_back([this, fd, peerEp]() {
-        clientLoop(fd, peerEp);
-    });
+    spawnClientThread(fd, ep);
     return fd;
 }
 

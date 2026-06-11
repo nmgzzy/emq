@@ -77,6 +77,18 @@ TEST(match_wildcard_static) {
     CHECK_TRUE(TopicRouter::matchWildcard("a/#",   "a/b/c/d"));
     CHECK_TRUE(TopicRouter::matchWildcard("#",     "anything"));
     CHECK_FALSE(TopicRouter::matchWildcard("a/b",  "a/b/c"));
+    // 末段 '#' 也匹配“剩余零段”
+    CHECK_TRUE(TopicRouter::matchWildcard("a/#",   "a"));
+}
+
+// '#' 仅在末段才作 match-all（MQTT 语义）；出现在中间段不得过度匹配
+TEST(match_wildcard_hash_must_be_last) {
+    CHECK_FALSE(TopicRouter::matchWildcard("a/#/b", "a/x/y/z"));
+    CHECK_FALSE(TopicRouter::matchWildcard("a/#/b", "a/x/b"));
+    CHECK_FALSE(TopicRouter::matchWildcard("#/b",   "a/b"));
+    // 末段 '#' 仍正常工作
+    CHECK_TRUE(TopicRouter::matchWildcard("a/b/#",  "a/b/c"));
+    CHECK_TRUE(TopicRouter::matchWildcard("a/b/#",  "a/b"));
 }
 
 // ---- 取消订阅 ----
