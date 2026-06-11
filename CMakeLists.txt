@@ -211,3 +211,40 @@ if(WANT_BENCH)
     add_executable(emq_bench bench/bench_main.cpp)
     emq_target_setup(emq_bench)
 endif()
+
+# =====================================================================
+# 安装规则（供打包 / Buildroot 等下游使用；随各 WANT_ 开关生效）
+# =====================================================================
+include(GNUInstallDirs)
+
+# 静态库 + 公共头文件（开发期：供 SDK / 其它项目链接）
+install(TARGETS embedmq
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY include/embedmq
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# 演示主程序
+install(TARGETS emq
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# C ABI 共享库（运行时 / FFI）
+if(WANT_CAPI)
+    install(TARGETS embedmq_c
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+
+# CLI 监控工具
+if(WANT_TOOLS)
+    install(TARGETS emqtop emq_stress
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+# 示例 / 基准（仅在对应开关打开时安装）
+if(WANT_EXAMPLES)
+    install(TARGETS example_pub_sub example_req_rep
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+if(WANT_BENCH)
+    install(TARGETS emq_bench
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()

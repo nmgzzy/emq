@@ -1,6 +1,7 @@
 #pragma once
 #include "embedmq/types.h"
 #include "embedmq/qos.h"
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <mutex>
