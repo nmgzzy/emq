@@ -45,6 +45,12 @@ public:
     // 线缆 CRC 开关（默认开启）。可信链路/高频小包可关闭以省 CPU。
     void setChecksumEnabled(bool on) { crcEnabled_ = on; }
 
+    // 保留消息约束：默认生存期（ms，0=永不过期）与条目数上限（0=不限制）。
+    // 过期清理挂载在 start() 的周期任务上。
+    void setRetainedLimits(uint32_t ttlMs, uint32_t maxCount) {
+        retainedStore_.configure(ttlMs, maxCount);
+    }
+
     // ---- Pub/Sub ----
     std::unique_ptr<Publisher>  createPublisher(const std::string& topic,
                                                 const QoSProfile& qos);

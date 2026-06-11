@@ -132,6 +132,7 @@ if has_config("build_tests") then
         add_files("tests/test_topic_router.cpp")
         add_files("tests/test_message_codec.cpp")
         add_files("tests/test_qos_engine.cpp")
+        add_files("tests/test_retained_store.cpp")
         add_files("tests/test_pal.cpp")
         add_files("tests/test_pub_sub.cpp")
         add_files("tests/test_req_rep.cpp")

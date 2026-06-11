@@ -40,6 +40,21 @@ struct ParticipantConfig {
     // 线缆校验和（CRC32）。高频小包/可信链路（如本机 SHM）可关闭以省 CPU。
     bool enableChecksum = true;
 
+    // 保留消息（retained）存储约束 —— 防止长期运行内存无界增长。
+    // 保留消息在 MQTT 语义下会一直驻留直至被同主题覆盖或删除；长期运行 +
+    // 大量主题时会持续累积。下列开关给出可配置的上界（默认全关，保持原语义）。
+    struct {
+        // 保留消息默认生存期（毫秒）。超过该时长未被刷新的保留消息将被丢弃，
+        // 使保留消息内存占用有上界。默认 10 分钟：状态类消息通常有时效性，
+        // 过期的"当前值"既无意义又会误导迟到的订阅者。设为 0 表示永不过期
+        // （恢复原始 MQTT 语义）。单条发布的 QoSProfile.lifespanMs 若 >0 则
+        // 覆盖此默认值。
+        uint32_t ttlMs    = 10 * 60 * 1000; // 10 min
+        // 保留消息条目数上限（按主题计）。超过时驱逐最早存入的条目。
+        // 0 = 不限制（默认）。
+        uint32_t maxCount = 0;
+    } retained;
+
     struct {
         uint32_t ioThreads     = 1;
         uint32_t workerThreads = 1;

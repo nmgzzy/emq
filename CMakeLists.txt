@@ -156,6 +156,7 @@ if(EMBEDMQ_BUILD_TESTS)
         tests/test_topic_router.cpp
         tests/test_message_codec.cpp
         tests/test_qos_engine.cpp
+        tests/test_retained_store.cpp
         tests/test_pal.cpp
         tests/test_pub_sub.cpp
         tests/test_req_rep.cpp

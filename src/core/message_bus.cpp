@@ -165,6 +165,8 @@ void MessageBus::start(int cpuAffinity) {
         qosEngine_.processTimeouts();
         // 周期清理 QoS2 去重窗口，避免长期运行内存无界增长。
         qosEngine_.cleanupDedupWindow();
+        // 丢弃过期的保留消息，使保留消息内存占用有上界（TTL 默认关闭）。
+        retainedStore_.expire();
 
         // 请求超时：按截止时间结束仍在等待的请求，避免远端无响应时 future 永久挂起。
         auto now = std::chrono::steady_clock::now();
@@ -298,7 +300,8 @@ bool MessageBus::publish(const std::string& topic,
         retained.timestamp = 0;
         retained.sourceId  = nodeId_;
         retained.sequenceId = seqId;
-        retainedStore_.store(topic, retained);
+        // QoSProfile.lifespanMs（>0）作为该条保留消息的 TTL，覆盖全局默认。
+        retainedStore_.store(topic, retained, qos.lifespanMs);
     }
 
     // 2. 本地路由
