@@ -203,6 +203,9 @@ if(WANT_TOOLS)
 
     add_executable(emq_stress tools/emq_stress/main.cpp)
     emq_target_setup(emq_stress)
+
+    add_executable(emq_simnode tools/emq_simnode/main.cpp)
+    emq_target_setup(emq_simnode)
 endif()
 
 # =====================================================================
@@ -236,7 +239,7 @@ endif()
 
 # CLI 监控工具
 if(WANT_TOOLS)
-    install(TARGETS emqtop emq_stress
+    install(TARGETS emqtop emq_stress emq_simnode
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 

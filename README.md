@@ -8,7 +8,7 @@
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)]()
 [![Build](https://img.shields.io/badge/build-xmake-green)]()
 [![Phase](https://img.shields.io/badge/phase-5%20done-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-2277%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-2302%20passed-brightgreen)]()
 
 ---
 
@@ -74,7 +74,7 @@ xmake run example_req_rep
 ### 运行单元测试
 
 ```bash
-# 运行全部测试（11 个模块，2277 个断言）
+# 运行全部测试（12 个模块，2302 个断言）
 xmake run emq_tests
 
 # 运行指定模块
@@ -444,6 +444,47 @@ cfg.threading.cpuAffinity = 2;   // 将内部工作线程绑定到 2 号核心
 tools/measure_resources.sh -i 0.5 -d 30 -- ./build/linux/x86_64/release/emq_stress soak -d 30
 ```
 
+### 嵌入式模拟器实测（QEMU aarch64 virt）
+
+在 Buildroot 交叉编译进 aarch64 根文件系统后，于 **QEMU `virt`（2 vCPU / 512 MB，
+Linux 6.18，glibc）** 中实测。`/proc` 周期采样统计资源占用。
+
+> ⚠️ **口径**：aarch64 在 x86 上为 **QEMU TCG 纯软件模拟**（跨架构无 KVM），故
+> 下列吞吐 / CPU 含模拟开销，**真机会显著更低**；内存（RSS）与是否模拟无关，可直接参考。
+
+**① 单进程压测（`emq_stress`，进程内同步投递，零丢失）**
+
+| 场景 | 结果 |
+|------|------|
+| throughput（1:1，100 万条 ×64B）| **622 K msg/s** |
+| fanout（1→16 订阅）| **588 K deliv/s**（160 万次投递）|
+| concurrent（4 生产者 ×8 订阅，5s）| **149 K msg/s**（投递 5984256/5984256 精确）|
+| reqrep（8 并发请求者，2 万请求）| **295 K req/s**，avg **21 µs** |
+| churn（2000 次参与者 create/destroy）| 90 cyc/s |
+| soak（混合负载 20s）| RSS 稳定 **~3.2 MB**、4 线程、3 FD、CPU **~0.81 核** |
+
+**② 8 节点真实联网稳态场景（`emq_simnode`，UDP + 多播自发现）**
+
+8 个独立进程（节点），各订阅 8 个共享主题，每秒向随机主题发布 10 条 64B 消息，
+运行 30s（每节点 sent=300、recv=2400，全网格全收、**零丢失**）：
+
+| 指标 | 8 节点合计 | **每节点平均** |
+|------|-----------|---------------|
+| 内存 RSS | 25.9 MB | **3.24 MB** |
+| CPU | 0.33 核（32.6% 单核）| **≈4.1% 单核** |
+| 线程 | 32 | **4** |
+| 收 / 发速率 | 收 640 / 发 80 msg/s | 收 80 / 发 10 msg/s |
+
+要点：
+
+- **单节点稳态开销极低**：~3.2 MB 常驻 + ~4% 单核即可支撑 10 Hz 随机收发，内存全程恒定、无泄漏；含进程间真实 UDP 编解码、CRC、发现心跳的全部成本。
+- 8 节点同机满负载也仅约 1/3 个核（模拟环境下），与 x64 实测的低占用画像一致。
+
+```bash
+# 单节点模拟器（一个进程=一个网络节点；多开几个即组成 N 节点网格）
+emq_simnode node1 --topics 8 --duration 30 --rate 10 --payload 64
+```
+
 ---
 
 ## 多语言与工具（Phase 5）
@@ -533,6 +574,20 @@ python3 bindings/python/stress.py reqrep -t 4
 
 参考自测结果（Linux x64, Release）：C++ 本地吞吐 ~11.6 M msg/s、Req/Rep 平均 ~2 µs；
 churn/soak 下 RSS 零增长，并发场景收发计数精确匹配。
+
+### emq_simnode —— 多节点真实场景模拟
+
+与 `emq_stress`（进程内、关网络）不同，`emq_simnode` 走真实 UDP + 多播发现：
+**一个进程即一个网络节点**，订阅一组共享主题并以固定频率向随机主题发布消息。
+多开几个即组成 N 节点网格，便于观测稳态业务负载下的逐节点 CPU / 内存占用
+（实测数据见上文「嵌入式模拟器实测」）。
+
+```bash
+# 8 节点 × 每秒 10 次随机收发 × 30s（各节点订阅 8 个主题，64B 载荷）
+for i in $(seq 1 8); do emq_simnode node$i --topics 8 --duration 30 --rate 10 --payload 64 & done; wait
+
+# 选项：--topics N  --duration S  --rate Hz  --payload B  --reliable(默认 BestEffort)
+```
 
 ---
 
@@ -638,7 +693,7 @@ xmake run emq_bench
 
 ## 测试覆盖
 
-> **平台：** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **总计：2277 assertions / 81 tests，全部通过**
+> **平台：** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **总计：2302 assertions / 87 tests，全部通过**
 
 | 测试套件 | 覆盖内容 | 断言数 |
 |---------|---------|--------|

@@ -8,7 +8,7 @@
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)]()
 [![Build](https://img.shields.io/badge/build-xmake-green)]()
 [![Phase](https://img.shields.io/badge/phase-5%20done-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-2277%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-2302%20passed-brightgreen)]()
 
 ---
 
@@ -74,7 +74,7 @@ xmake run example_req_rep
 ### Run unit tests
 
 ```bash
-# All tests (11 modules, 2277 assertions)
+# All tests (12 modules, 2302 assertions)
 xmake run emq_tests
 
 # Specific modules
@@ -442,6 +442,49 @@ Highlights:
 tools/measure_resources.sh -i 0.5 -d 30 -- ./build/linux/x86_64/release/emq_stress soak -d 30
 ```
 
+### Embedded simulator (QEMU aarch64 virt)
+
+Cross-compiled into an aarch64 rootfs via Buildroot and measured inside
+**QEMU `virt` (2 vCPU / 512 MB, Linux 6.18, glibc)**; resource usage sampled from `/proc`.
+
+> ⚠️ **Caveat**: aarch64 here runs under **QEMU TCG (pure software emulation, no
+> cross-arch KVM)**, so the throughput / CPU figures include emulation overhead and
+> are **much lower than native**. Memory (RSS) is unaffected by emulation and is directly representative.
+
+**① Single-process stress (`emq_stress`, in-process synchronous delivery, loss-free)**
+
+| Scenario | Result |
+|----------|--------|
+| throughput (1:1, 1M msgs ×64B) | **622 K msg/s** |
+| fanout (1→16 subs) | **588 K deliv/s** (1.6M deliveries) |
+| concurrent (4 producers ×8 subs, 5s) | **149 K msg/s** (5984256/5984256 exact) |
+| reqrep (8 concurrent requesters, 20k requests) | **295 K req/s**, avg **21 µs** |
+| churn (2000 participant create/destroy cycles) | 90 cyc/s |
+| soak (mixed load, 20s) | RSS stable **~3.2 MB**, 4 threads, 3 FDs, CPU **~0.81 core** |
+
+**② 8-node real-network steady-state (`emq_simnode`, UDP + multicast discovery)**
+
+8 independent processes (nodes), each subscribing to 8 shared topics and publishing 10×
+64B messages per second to a random topic, for 30s (per node sent=300, recv=2400,
+full-mesh delivery, **zero loss**):
+
+| Metric | 8 nodes total | **per-node avg** |
+|--------|---------------|------------------|
+| Memory RSS | 25.9 MB | **3.24 MB** |
+| CPU | 0.33 core (32.6% of one) | **≈4.1% of one core** |
+| Threads | 32 | **4** |
+| Recv / send rate | recv 640 / send 80 msg/s | recv 80 / send 10 msg/s |
+
+Takeaways:
+
+- **Very low per-node steady-state cost**: ~3.2 MB resident + ~4% of a core sustains 10 Hz random pub/sub, with constant memory and no leaks — including the full cost of inter-process UDP encode/decode, CRC, and discovery heartbeats.
+- Even 8 nodes fully loaded on one host take only ~1/3 of a core (under emulation), matching the low-footprint profile measured on x64.
+
+```bash
+# One simulated node (one process = one network node; spawn several for an N-node mesh)
+emq_simnode node1 --topics 8 --duration 30 --rate 10 --payload 64
+```
+
 ---
 
 ## Multi-language and tools (Phase 5)
@@ -527,6 +570,20 @@ python3 bindings/python/stress.py reqrep -t 4
 ```
 
 Reference (Linux x64, Release): C++ local throughput ~11.6 M msg/s, Req/Rep avg ~2 µs; zero RSS growth in churn/soak; exact send/receive counts under concurrency.
+
+### emq_simnode — multi-node real-world simulation
+
+Unlike `emq_stress` (in-process, network off), `emq_simnode` uses real UDP + multicast
+discovery: **one process is one network node**, subscribing to a set of shared topics and
+publishing to a random topic at a fixed rate. Spawn several to form an N-node mesh and
+observe per-node CPU / memory under steady-state load (measurements in "Embedded simulator" above).
+
+```bash
+# 8 nodes × 10 random pub/sub per second × 30s (each subscribes to 8 topics, 64B payload)
+for i in $(seq 1 8); do emq_simnode node$i --topics 8 --duration 30 --rate 10 --payload 64 & done; wait
+
+# Options: --topics N  --duration S  --rate Hz  --payload B  --reliable (default BestEffort)
+```
 
 ---
 
@@ -632,7 +689,7 @@ xmake run emq_bench
 
 ## Test coverage
 
-> **Platforms:** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **Total: 2277 assertions / 81 tests, all passing**
+> **Platforms:** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **Total: 2302 assertions / 87 tests, all passing**
 
 | Suite | Coverage | Assertions |
 |-------|----------|------------|
