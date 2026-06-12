@@ -364,13 +364,17 @@ bool MessageBus::publish(const std::string& topic,
                         transportMgr_->send(ep, d.data(), d.size());
                 });
         } else if (transportMgr_) {
-            // BestEffort：零拷贝 scatter/gather 发送 {header, topic, payload}
-            auto header = MessageCodec::encodeHeader(
+            // BestEffort：零拷贝 scatter/gather 发送 {header, topic, payload}。
+            // 线缆头编入 thread_local 缓冲并复用其容量——稳态零堆分配。该缓冲仅在
+            // encodeHeaderInto 与紧随的同步 sendv 之间存活，其间不回调用户代码，
+            // 故对热路径无重入风险。
+            thread_local std::vector<uint8_t> headerBuf;
+            MessageCodec::encodeHeaderInto(headerBuf,
                 MessageType::PUBLISH, nodeId_, 0xFFFF,
                 topic, payload, qos, epSeqId, 0, flags, 0, crcEnabled_);
             IoSlice slices[3];
             int n = 0;
-            slices[n++] = IoSlice{ header.data(), header.size() };
+            slices[n++] = IoSlice{ headerBuf.data(), headerBuf.size() };
             if (!topic.empty())
                 slices[n++] = IoSlice{ topic.data(), topic.size() };
             if (payload.size() > 0)

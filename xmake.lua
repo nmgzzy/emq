@@ -39,6 +39,16 @@ local want_capi    = has_config("build_capi")     and not embedded
 local want_tools   = has_config("build_tools")    and not embedded
 if embedded then
     add_defines("EMBEDMQ_EMBEDDED_PROFILE")
+    -- 优化取向（仅 GCC/Clang）：偏向 CPU/吞吐而非体积——嵌入式磁盘/Flash 通常够用，
+    -- 瓶颈在 CPU 与内存。用 -O2（此 I/O 密集型中间件的甜点；-O3 的向量化/展开在小消息
+    -- 负载上收益小且增大 i-cache 压力，故不取）。LTO 做跨 TU 内联（利于 CPU，并顺带减体积），
+    -- --gc-sections 仅删未引用段、strip 去符号——二者零性能代价的免费体积收益，保留。
+    -- 注：-O2 以 force 覆盖构建模式的优化级（含 debug 的 -O0）；embedded 画像面向 release 式交叉构建。
+    if not is_plat("windows") then
+        add_cxflags("-O2", "-ffunction-sections", "-fdata-sections", { force = true })
+        add_ldflags("-Wl,--gc-sections", "-s", { force = true })
+        set_policy("build.optimization.lto", true)
+    end
 end
 
 -- ---- 平台 PAL 源码选择 ----

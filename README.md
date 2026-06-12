@@ -8,7 +8,7 @@
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)]()
 [![Build](https://img.shields.io/badge/build-xmake-green)]()
 [![Phase](https://img.shields.io/badge/phase-5%20done-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-2302%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-2328%20passed-brightgreen)]()
 
 ---
 
@@ -74,7 +74,7 @@ xmake run example_req_rep
 ### 运行单元测试
 
 ```bash
-# 运行全部测试（12 个模块，2302 个断言）
+# 运行全部测试（12 个模块，2328 个断言）
 xmake run emq_tests
 
 # 运行指定模块
@@ -393,14 +393,16 @@ auto p = embedmq::Participant::create(cfg);
 
 每个节点拥有一个有界的「收件箱」槽位环（默认 256 槽 × 4 KB），多个进程作为生产者并发写入（CAS 预留槽位），节点自身的轮询线程作为唯一消费者读取。
 
-### 零拷贝 scatter/gather
+### 零拷贝 scatter/gather + 热路径零稳态分配
 
-BestEffort（QoS 0）发布路径使用 `encodeHeader` 仅生成紧凑线缆头（协议 v2：基础 26 字节 + 可选 timestamp/CRC），配合 `sendmsg`/`WSASendTo` 的 iovec 分片发送 `{header, topic, payload}`，避免将载荷再拷贝进单一缓冲。
+BestEffort（QoS 0）发布路径使用 `MessageCodec::encodeHeaderInto()` 仅生成紧凑线缆头（协议 v2：基础 26 字节 + 可选 timestamp/CRC），配合 `sendmsg`/`WSASendTo` 的 iovec 分片发送 `{header, topic, payload}`，避免将载荷再拷贝进单一缓冲。
+
+进一步地，线缆头被编入一个 **`thread_local` 复用缓冲**（`clear()` 保留容量）：稳态下发布热路径**零堆分配**，提供确定性的分配延迟（嵌入式关键）。该缓冲仅在编码与紧随的同步 `sendv` 之间存活，其间不回调用户代码，无重入风险。编解码同时提供写入调用方缓冲的 `encodeInto()` / `encodeHeaderInto()`，与原 `encode()` / `encodeHeader()` 逐字节等价。
 
 ### 内存池与无锁队列
 
-以下为库内置的**可选工具组件**（已在 `tests`/`bench` 中验证），当前核心收发路径
-默认仍使用 `std::vector`/标准容器，尚未默认接入；可按需在自定义传输/队列中使用：
+以下为库内置的**可选工具组件**（已在 `tests`/`bench` 中验证），发布热路径已采用上述
+`thread_local` 缓冲复用消除稳态分配；这些固定块池 / 无锁队列可按需在自定义传输/队列中使用：
 
 - `util::FixedBlockPool`：固定块内存池，O(1) 分配/归还，提供确定性延迟，避免碎片。
 - `util::MpscQueue`：无锁多生产者单消费者队列（Vyukov 算法）。
@@ -437,6 +439,13 @@ cfg.threading.cpuAffinity = 2;   // 将内部工作线程绑定到 2 号核心
 | 高并发（8 生产者 × 8 订阅者）| **4.06 MB** | 10 | 24 | ~803%（≈8 核）|
 
 二进制/库体积：`emqtop` ~275 KB、`libembedmq_c.so` ~292 KB、`libembedmq.a` ~629 KB。
+
+> **嵌入式画像的编译取向（偏 CPU/吞吐）**：`--profile=embedded` 采用 `-O2`（小消息
+> 中间件的甜点；不取 `-O3`，以免向量化/展开在该负载上收益甚微却增大 i-cache 压力）
+> + LTO（跨模块内联，利于 CPU）+ `--gc-sections` + strip。LTO 与死代码 GC 即便面向速度
+> 也顺带减体积：以同源构建的 `emq_tests`（链接近乎整个库）为基准，代码段 `.text` 较
+> full release（`-O3`）的 ~632 KB 降至 ~401 KB。磁盘/Flash 充裕、希望进一步提速的目标
+> 可直接用此画像；若反而要极限瘦身，把 `-O2` 换成 `-Os` 即可。
 
 要点：
 
@@ -703,6 +712,10 @@ participant->registerTransport("can",
 ## 构建选项
 
 ```bash
+# 嵌入式画像：关闭 TCP/示例/基准/io_uring/capi/工具；编译取向偏 CPU/吞吐——
+# -O2 + LTO（跨模块内联）+ 段级编译/链接期段 GC(--gc-sections) + strip（仅 GCC/Clang）。
+xmake f --profile=embedded && xmake
+
 # 禁用 TCP（仅 UDP）
 xmake f --enable_tcp=n
 
@@ -732,12 +745,12 @@ xmake run emq_bench
 
 ## 测试覆盖
 
-> **平台：** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **总计：2302 assertions / 87 tests，全部通过**
+> **平台：** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **总计：2328 assertions / 92 tests，全部通过**
 
 | 测试套件 | 覆盖内容 | 断言数 |
 |---------|---------|--------|
 | `test_topic_router` | 精确匹配、`*`/`#` 通配符、取消订阅、多订阅者 | 20 |
-| `test_message_codec` | 编解码正确性、CRC32 完整性、边界条件 | 23 |
+| `test_message_codec` | 编解码正确性、CRC32 完整性、边界条件、缓冲复用编码（`encodeInto`/`encodeHeaderInto` 等价性与零分配复用）| 49 |
 | `test_qos_engine` | ACK 确认、超时重传、放弃机制、QoS 2 去重 | 14 |
 | `test_pal` | 进程工具、CRC32、无锁环形缓冲、时间轮定时器 | 24 |
 | `test_pub_sub` | 本地 Pub/Sub、通配符路由、保留消息、暂停/恢复 | 10 |

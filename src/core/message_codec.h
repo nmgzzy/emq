@@ -62,7 +62,11 @@ struct WireHeader {
 
 class MessageCodec {
 public:
-    static std::vector<uint8_t> encode(
+    /// 编码整包到调用方提供的缓冲区。复用 buf 已有容量——在高频收发热路径上
+    /// 反复传入同一个（如 thread_local）缓冲，稳态可达零堆分配，并提供确定性
+    /// 分配延迟（嵌入式关键）。字段超限时清空 buf 并返回 false。
+    static bool encodeInto(
+        std::vector<uint8_t>& buf,
         MessageType type,
         uint16_t sourceId,
         uint16_t destId,
@@ -75,8 +79,9 @@ public:
         uint8_t  serializerId  = 0,
         bool     withCrc       = true)
     {
+        buf.clear(); // clear() 保留容量，复用缓冲的关键
         if (topic.size() > MAX_TOPIC_LEN || payload.size() > MAX_PAYLOAD_LEN)
-            return {};
+            return false;
 
         const bool withTs = isDataMsg(type);
         const size_t headerSize = HEADER_BASE_SIZE + (withTs ? 8 : 0) + (withCrc ? 4 : 0);
@@ -85,7 +90,6 @@ public:
         // 单次分配后写头 + 追加 body。用 insert 追加（而非 buf.data()+headerSize 上的
         // memcpy）让写入位置与缓冲长度由 vector 自身维护，避免“控制/空载荷包”下
         // 一过末尾指针触发 GCC -Warray-bounds 误报。
-        std::vector<uint8_t> buf;
         buf.reserve(total);
         buf.resize(headerSize);
         size_t checksumPos = 0;
@@ -103,12 +107,10 @@ public:
             uint32_t crc = computeCrcContiguous(buf.data(), buf.size(), checksumPos);
             putU32(buf.data() + checksumPos, crc);
         }
-        return buf;
+        return true;
     }
 
-    /// 零拷贝编码：仅生成线缆头，topic/payload 由调用方以 scatter/gather 分片发送。
-    /// checksum（若启用）覆盖 header(去除 checksum 字段) + topic + payload，与 decode 一致。
-    static std::vector<uint8_t> encodeHeader(
+    static std::vector<uint8_t> encode(
         MessageType type,
         uint16_t sourceId,
         uint16_t destId,
@@ -121,13 +123,37 @@ public:
         uint8_t  serializerId  = 0,
         bool     withCrc       = true)
     {
+        std::vector<uint8_t> buf;
+        encodeInto(buf, type, sourceId, destId, topic, payload, qos,
+                   sequenceId, correlationId, flags, serializerId, withCrc);
+        return buf; // 失败时 encodeInto 已清空 buf，返回空 vector（与旧行为一致）
+    }
+
+    /// 零拷贝编码：仅生成线缆头到调用方缓冲，topic/payload 由调用方以 scatter/gather
+    /// 分片发送。checksum（若启用）覆盖 header(去除 checksum 字段) + topic + payload，
+    /// 与 decode 一致。复用 buf 容量，热路径稳态零分配。失败返回 false 并清空 buf。
+    static bool encodeHeaderInto(
+        std::vector<uint8_t>& buf,
+        MessageType type,
+        uint16_t sourceId,
+        uint16_t destId,
+        const std::string& topic,
+        const Payload& payload,
+        const QoSProfile& qos,
+        uint32_t sequenceId,
+        uint32_t correlationId = 0,
+        uint8_t  flags         = 0,
+        uint8_t  serializerId  = 0,
+        bool     withCrc       = true)
+    {
+        buf.clear();
         if (topic.size() > MAX_TOPIC_LEN || payload.size() > MAX_PAYLOAD_LEN)
-            return {};
+            return false;
 
         const bool withTs = isDataMsg(type);
         const size_t headerSize = HEADER_BASE_SIZE + (withTs ? 8 : 0) + (withCrc ? 4 : 0);
 
-        std::vector<uint8_t> buf(headerSize);
+        buf.resize(headerSize); // writeHeader 覆写全部 headerSize 字节，无需依赖零初始化
         size_t checksumPos = 0;
         writeHeader(buf.data(), type, sourceId, destId,
                     static_cast<uint16_t>(topic.size()),
@@ -145,6 +171,25 @@ public:
                 state = util::crc32_update(state, payload.data(), payload.size());
             putU32(buf.data() + checksumPos, ~state);
         }
+        return true;
+    }
+
+    static std::vector<uint8_t> encodeHeader(
+        MessageType type,
+        uint16_t sourceId,
+        uint16_t destId,
+        const std::string& topic,
+        const Payload& payload,
+        const QoSProfile& qos,
+        uint32_t sequenceId,
+        uint32_t correlationId = 0,
+        uint8_t  flags         = 0,
+        uint8_t  serializerId  = 0,
+        bool     withCrc       = true)
+    {
+        std::vector<uint8_t> buf;
+        encodeHeaderInto(buf, type, sourceId, destId, topic, payload, qos,
+                         sequenceId, correlationId, flags, serializerId, withCrc);
         return buf;
     }
 

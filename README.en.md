@@ -8,7 +8,7 @@
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)]()
 [![Build](https://img.shields.io/badge/build-xmake-green)]()
 [![Phase](https://img.shields.io/badge/phase-5%20done-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-2302%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-2328%20passed-brightgreen)]()
 
 ---
 
@@ -74,7 +74,7 @@ xmake run example_req_rep
 ### Run unit tests
 
 ```bash
-# All tests (12 modules, 2302 assertions)
+# All tests (12 modules, 2328 assertions)
 xmake run emq_tests
 
 # Specific modules
@@ -393,13 +393,15 @@ auto p = embedmq::Participant::create(cfg);
 
 Each node has a bounded inbox slot ring (default 256 slots × 4 KB). Multiple processes write as producers (CAS slot reservation); the node's poll thread is the sole consumer.
 
-### Zero-copy scatter/gather
+### Zero-copy scatter/gather + zero steady-state allocation on the hot path
 
-BestEffort (QoS 0) publish uses `encodeHeader` for a compact wire header (protocol v2: 26-byte base + optional timestamp/CRC) and `sendmsg`/`WSASendTo` iovec `{header, topic, payload}` without copying payload into one buffer.
+BestEffort (QoS 0) publish uses `MessageCodec::encodeHeaderInto()` for a compact wire header (protocol v2: 26-byte base + optional timestamp/CRC) and `sendmsg`/`WSASendTo` iovec `{header, topic, payload}` without copying payload into one buffer.
+
+Furthermore, the wire header is encoded into a **`thread_local` reusable buffer** (`clear()` keeps capacity): the publish hot path performs **zero heap allocation** in steady state, with deterministic allocation latency (critical for embedded). The buffer lives only between encoding and the immediately following synchronous `sendv`, with no user callback in between — so there is no re-entrancy hazard. The codec also exposes `encodeInto()` / `encodeHeaderInto()` that write into a caller-provided buffer, byte-for-byte equivalent to `encode()` / `encodeHeader()`.
 
 ### Memory pool and lock-free queues
 
-Optional **utility components** (validated in `tests`/`bench`). The default hot path still uses `std::vector`/standard containers; plug in custom transports/queues as needed:
+Optional **utility components** (validated in `tests`/`bench`). The publish hot path already eliminates steady-state allocation via the `thread_local` buffer reuse above; these fixed-block pools / lock-free queues can be plugged into custom transports/queues as needed:
 
 - `util::FixedBlockPool`: O(1) alloc/free, predictable latency, less fragmentation.
 - `util::MpscQueue`: Lock-free MPSC (Vyukov).
@@ -435,6 +437,16 @@ cfg.threading.cpuAffinity = 2;   // Pin worker thread to core 2
 | High concurrency (8 producers × 8 subscribers) | **4.06 MB** | 10 | 24 | ~803% (~8 cores) |
 
 Binary/library size: `emqtop` ~275 KB, `libembedmq_c.so` ~292 KB, `libembedmq.a` ~629 KB.
+
+> **Embedded-profile codegen (CPU/throughput-leaning)**: `--profile=embedded` uses
+> `-O2` (the sweet spot for a small-message middleware; not `-O3`, whose
+> vectorization/unrolling barely helps this workload while raising i-cache pressure)
+> + LTO (cross-module inlining, helps CPU) + `--gc-sections` + strip. LTO and
+> dead-code GC still trim size even when targeting speed: using `emq_tests` (links
+> nearly the whole library) built from identical sources as the yardstick, the code
+> section (`.text`) drops from ~632 KB (full release, `-O3`) to ~401 KB. Targets with
+> ample disk/Flash that want more speed can use this profile directly; swap `-O2` for
+> `-Os` if you instead need maximum size trimming.
 
 Highlights:
 
@@ -704,6 +716,11 @@ participant->registerTransport("can",
 ## Build options
 
 ```bash
+# Embedded profile: disables TCP/examples/bench/io_uring/capi/tools; codegen leans
+# toward CPU/throughput — -O2 + LTO (cross-module inlining) + per-section compilation
+# / link-time section GC (--gc-sections) + strip (GCC/Clang only).
+xmake f --profile=embedded && xmake
+
 # Disable TCP (UDP only)
 xmake f --enable_tcp=n
 
@@ -733,12 +750,12 @@ xmake run emq_bench
 
 ## Test coverage
 
-> **Platforms:** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **Total: 2302 assertions / 87 tests, all passing**
+> **Platforms:** Linux x64 (GCC) / Windows 10 x64 (MSVC 2022) | **Total: 2328 assertions / 92 tests, all passing**
 
 | Suite | Coverage | Assertions |
 |-------|----------|------------|
 | `test_topic_router` | Exact match, `*`/`#` wildcards, unsubscribe, multiple subscribers | 20 |
-| `test_message_codec` | Encode/decode, CRC32 integrity, edge cases | 23 |
+| `test_message_codec` | Encode/decode, CRC32 integrity, edge cases, buffer-reuse encoding (`encodeInto`/`encodeHeaderInto` equivalence & zero-alloc reuse) | 49 |
 | `test_qos_engine` | ACK, timeout retransmit, give-up, QoS 2 dedup | 14 |
 | `test_pal` | Process utils, CRC32, lock-free ring, timer wheel | 24 |
 | `test_pub_sub` | Local pub/sub, wildcard routing, retained, pause/resume | 10 |

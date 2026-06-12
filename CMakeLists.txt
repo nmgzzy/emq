@@ -33,6 +33,21 @@ else()
     set(EMBEDMQ_EMBEDDED OFF)
 endif()
 
+# embedded 优化取向（仅 GCC/Clang，与 xmake.lua 对应）：偏向 CPU/吞吐而非体积。
+# -O2（此 I/O 密集型中间件的甜点，避免 -O3 的体积膨胀/i-cache 压力）+ LTO（跨模块
+# 内联，利于 CPU 与体积）+ --gc-sections（仅删未引用段）+ strip。在所有后续 target 生效。
+if(EMBEDMQ_EMBEDDED AND NOT MSVC)
+    add_compile_options(-O2 -ffunction-sections -fdata-sections)
+    add_link_options(-Wl,--gc-sections -s)
+    # CMake Release 默认含 -O3，改回 -O2 以免其覆盖上面的 -O2
+    string(REPLACE "-O3" "-O2" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT EMQ_IPO_OK OUTPUT EMQ_IPO_MSG)
+    if(EMQ_IPO_OK)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+    endif()
+endif()
+
 if(EMBEDMQ_EMBEDDED)
     set(WANT_TCP OFF)
     set(WANT_IOURING OFF)
