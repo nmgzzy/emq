@@ -26,6 +26,9 @@ option("build_tools",    { default = true,  description = "Build CLI monitoring 
 option("enable_tcp",     { default = false, description = "Enable TCP transport (Phase 2)" })
 option("enable_shm",     { default = true,  description = "Enable shared-memory transport (Phase 3)" })
 option("enable_io_uring",{ default = false, description = "Enable io_uring event loop (Linux, experimental, Phase 3)" })
+-- 编译取向（codegen）与画像的特性裁剪解耦：默认随 embedded 画像开启，亦可在 full 画像上
+-- 单独 --embedded_codegen=y 启用——这样既得 embedded 代码生成取向，又保留工具/基准等特性。
+option("embedded_codegen",{ default = false, description = "Apply embedded compile orientation (-O2/LTO/gc-sections/strip) independently of profile" })
 
 -- 解析画像，得到各特性最终开关（embedded 为强约束的瘦身画像）
 local embedded     = (get_config("profile") == "embedded")
@@ -39,6 +42,10 @@ local want_capi    = has_config("build_capi")     and not embedded
 local want_tools   = has_config("build_tools")    and not embedded
 if embedded then
     add_defines("EMBEDMQ_EMBEDDED_PROFILE")
+end
+-- 编译取向：embedded 画像默认套用，full 画像可 --embedded_codegen=y 单独启用（与特性裁剪解耦）。
+local want_codegen = embedded or has_config("embedded_codegen")
+if want_codegen then
     -- 优化取向（仅 GCC/Clang）：偏向 CPU/吞吐而非体积——嵌入式磁盘/Flash 通常够用，
     -- 瓶颈在 CPU 与内存。用 -O2（此 I/O 密集型中间件的甜点；-O3 的向量化/展开在小消息
     -- 负载上收益小且增大 i-cache 压力，故不取）。LTO 做跨 TU 内联（利于 CPU，并顺带减体积），

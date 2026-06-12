@@ -447,6 +447,12 @@ Binary/library size: `emqtop` ~275 KB, `libembedmq_c.so` ~292 KB, `libembedmq.a`
 > section (`.text`) drops from ~632 KB (full release, `-O3`) to ~401 KB. Targets with
 > ample disk/Flash that want more speed can use this profile directly; swap `-O2` for
 > `-Os` if you instead need maximum size trimming.
+>
+> **Codegen decoupled from feature trimming**: the codegen orientation above can also be
+> enabled on the **full profile** alone, keeping `emqtop`/tools/C ABI (needed by the
+> benchmark & comparison harnesses) while getting embedded-style code generation:
+> `xmake f --embedded_codegen=y` for xmake, `-DEMBEDMQ_EMBEDDED_CODEGEN=ON` for CMake.
+> (`--profile=embedded` still enables this orientation by default.)
 
 Highlights:
 
@@ -720,6 +726,10 @@ participant->registerTransport("can",
 # toward CPU/throughput — -O2 + LTO (cross-module inlining) + per-section compilation
 # / link-time section GC (--gc-sections) + strip (GCC/Clang only).
 xmake f --profile=embedded && xmake
+
+# Apply only the embedded codegen orientation while keeping all tools/features
+# (decoupled from profile trimming; used by the benchmark harnesses).
+xmake f --embedded_codegen=y && xmake
 
 # Disable TCP (UDP only)
 xmake f --enable_tcp=n

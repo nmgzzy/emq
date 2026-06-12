@@ -446,6 +446,11 @@ cfg.threading.cpuAffinity = 2;   // 将内部工作线程绑定到 2 号核心
 > 也顺带减体积：以同源构建的 `emq_tests`（链接近乎整个库）为基准，代码段 `.text` 较
 > full release（`-O3`）的 ~632 KB 降至 ~401 KB。磁盘/Flash 充裕、希望进一步提速的目标
 > 可直接用此画像；若反而要极限瘦身，把 `-O2` 换成 `-Os` 即可。
+>
+> **编译取向与特性裁剪解耦**：上述 codegen 取向也可在 **full 画像**上单独启用，从而既得
+> embedded 的代码生成，又保留 `emqtop`/工具/C ABI 等特性（基准/对比 harness 需要）：
+> xmake 用 `xmake f --embedded_codegen=y`，CMake 用 `-DEMBEDMQ_EMBEDDED_CODEGEN=ON`。
+> （`--profile=embedded` 仍默认开启该取向。）
 
 要点：
 
@@ -715,6 +720,9 @@ participant->registerTransport("can",
 # 嵌入式画像：关闭 TCP/示例/基准/io_uring/capi/工具；编译取向偏 CPU/吞吐——
 # -O2 + LTO（跨模块内联）+ 段级编译/链接期段 GC(--gc-sections) + strip（仅 GCC/Clang）。
 xmake f --profile=embedded && xmake
+
+# 仅套用 embedded 编译取向、但保留全部工具/特性（与画像裁剪解耦；基准 harness 用）
+xmake f --embedded_codegen=y && xmake
 
 # 禁用 TCP（仅 UDP）
 xmake f --enable_tcp=n
