@@ -120,8 +120,11 @@ private:
     void sendNack(const Endpoint& to, uint32_t seqId);
     // QoS2 两阶段握手控制包
     void sendCtrl(const Endpoint& to, MessageType type, uint32_t seqId);
+    // registerRetransmit=true 时（首次应答）对可靠请求登记 REPLY 重传至收到 ACK；
+    // false 时仅单发一次（用于对重复 REQUEST 重发已缓存的应答，不再叠加重传项）。
     void sendReply(const Endpoint& to, uint32_t correlationId,
-                   const Payload& payload, const QoSProfile& qos);
+                   const Payload& payload, const QoSProfile& qos,
+                   bool registerRetransmit = true);
 
     // 在对端宣布的多个端点中按本地可用传输与能力优选数据面：
     // SHM（仅同主机）> TCP > UDP。返回选定端点（无可用时返回首个/空端点）。
@@ -167,6 +170,22 @@ private:
     // service handler 注册
     mutable std::mutex serviceMutex_;
     std::unordered_map<std::string, RequestHandler> serviceHandlers_;
+
+    // 请求去重 / 应答缓存（replier 侧）：requester 在截止时间内会重传同一 REQUEST
+    // （携带相同的 correlationId，但每次 seqId 不同），若每次都执行 handler 会导致
+    // 重复副作用。按 (sourceId, correlationId) 缓存首个 REQUEST 的应答：命中即重发
+    // 缓存的应答而不再执行 handler。条目由周期任务按 TTL 回收（见 expireReplyCache）。
+    struct CachedReply {
+        Payload                               response;
+        QoSProfile                            qos;
+        std::chrono::steady_clock::time_point cachedAt;
+    };
+    static uint64_t replyKey(uint16_t sourceId, uint32_t corrId) {
+        return (static_cast<uint64_t>(sourceId) << 32) | corrId;
+    }
+    std::mutex replyCacheMutex_;
+    std::unordered_map<uint64_t, CachedReply> replyCache_;
+    void expireReplyCache();
 
     // 本地 topic/service 集合变化通知（见 setTopicsChangedCallback）
     std::mutex             topicsCbMutex_;

@@ -169,8 +169,10 @@ void MessageBus::start(int cpuAffinity) {
         qosEngine_.processTimeouts();
         // 周期清理 QoS2 去重窗口，避免长期运行内存无界增长。
         qosEngine_.cleanupDedupWindow();
-        // 丢弃过期的保留消息，使保留消息内存占用有上界（TTL 默认关闭）。
+        // 丢弃过期的保留消息，使保留消息内存占用有上界（默认 10 分钟 TTL）。
         retainedStore_.expire();
+        // 回收过期的请求响应缓存（远端 REQUEST 去重用），避免无界增长。
+        expireReplyCache();
 
         // 请求超时与重传：截止则结束 future；未截止的远端请求按 retryInterval
         // 重新解析路由并重传——提供方上线后即可送达，修复"请求发出过早即丢失"。
@@ -473,6 +475,23 @@ void MessageBus::onReceived(const Endpoint& from,
         if (svcName.substr(0, prefix.size()) == prefix)
             svcName = svcName.substr(prefix.size());
 
+        const uint64_t key = replyKey(result.header.sourceId,
+                                      result.header.correlationId);
+
+        // 去重：requester 在截止时间内会重传同一 REQUEST（correlationId 不变，
+        // seqId 每次不同）。若该请求已应答过，直接重发缓存的应答，绝不重复执行
+        // handler（避免重复副作用）。重发为单发，不再叠加 REPLY 重传项。
+        {
+            std::lock_guard<std::mutex> lock(replyCacheMutex_);
+            auto it = replyCache_.find(key);
+            if (it != replyCache_.end()) {
+                sendReply(from, result.header.correlationId,
+                          it->second.response, it->second.qos,
+                          /*registerRetransmit=*/false);
+                return;
+            }
+        }
+
         RequestHandler handler;
         {
             std::lock_guard<std::mutex> lock(serviceMutex_);
@@ -490,6 +509,12 @@ void MessageBus::onReceived(const Endpoint& from,
             Payload response = handler(req);
             QoSProfile qos;
             qos.level = qosLevel;
+            // 先缓存再发送：后续重传的同一 REQUEST 命中缓存即重发，不再执行 handler。
+            {
+                std::lock_guard<std::mutex> lock(replyCacheMutex_);
+                replyCache_[key] = CachedReply{
+                    response, qos, std::chrono::steady_clock::now() };
+            }
             sendReply(from, result.header.correlationId, response, qos);
         }
         return;
@@ -586,7 +611,8 @@ void MessageBus::sendCtrl(const Endpoint& to, MessageType type, uint32_t seqId) 
 }
 
 void MessageBus::sendReply(const Endpoint& to, uint32_t correlationId,
-                            const Payload& payload, const QoSProfile& qos)
+                            const Payload& payload, const QoSProfile& qos,
+                            bool registerRetransmit)
 {
     uint32_t seqId = seqCounter_++;
     auto data = MessageCodec::encode(
@@ -594,17 +620,31 @@ void MessageBus::sendReply(const Endpoint& to, uint32_t correlationId,
         "", payload, qos, seqId, correlationId, 0, 0, crcEnabled_);
     if (transportMgr_) transportMgr_->send(to, data.data(), data.size());
 
-    // 可靠请求：REPLY 也必须可靠送达，否则丢失的 REPLY 只会让 requester 超时而不重试。
-    // 登记 REPLY 重传，直到 requester 回 ACK（ACK 携带本 seqId，由 onReceived 的
-    // ACK 分支经 qosEngine_.onAck 取消，与 QoS1 PUBLISH 完全对称）。处理器仅在首个
-    // REQUEST 时执行一次，丢失的是 REPLY——故重传 REPLY 即可，无需缓存响应或对
-    // REQUEST 去重。
-    if (qos.level >= QoSLevel::Reliable) {
+    // 可靠请求：首个应答登记 REPLY 重传，直到 requester 回 ACK（ACK 携带本 seqId，
+    // 由 onReceived 的 ACK 分支经 qosEngine_.onAck 取消，与 QoS1 PUBLISH 对称）。
+    // 重复 REQUEST 命中应答缓存时以 registerRetransmit=false 单发，不再叠加重传项
+    // （否则每个重复请求都会新增一条 pending REPLY，无谓占用 QoS 引擎）。
+    if (registerRetransmit && qos.level >= QoSLevel::Reliable) {
         Endpoint ep = to;
         qosEngine_.addPending(seqId, data, qos,
             [this, ep](const std::vector<uint8_t>& d) {
                 if (transportMgr_) transportMgr_->send(ep, d.data(), d.size());
             });
+    }
+}
+
+void MessageBus::expireReplyCache() {
+    // 应答缓存仅需覆盖 requester 的请求重传窗口，超时后即可回收。30s 足以覆盖
+    // 默认 5s 及常见自定义截止时间，同时让长期运行的内存占用有上界。
+    using namespace std::chrono;
+    constexpr auto kReplyCacheTtl = seconds(30);
+    auto now = steady_clock::now();
+    std::lock_guard<std::mutex> lock(replyCacheMutex_);
+    for (auto it = replyCache_.begin(); it != replyCache_.end(); ) {
+        if (now - it->second.cachedAt >= kReplyCacheTtl)
+            it = replyCache_.erase(it);
+        else
+            ++it;
     }
 }
 
