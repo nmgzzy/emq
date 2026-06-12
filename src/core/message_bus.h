@@ -88,10 +88,14 @@ public:
                  uint8_t flags = 0);
 
     // ---- 内部：发起请求 ----
+    // timeoutOverride>0 时作为该请求的内部截止时间（供 request(payload,timeout)
+    // 透传调用方超时）；为 0 时回退到按 QoS 推导（ackTimeoutMs*(maxRetries+1)）。
     std::future<Payload> sendRequest(const std::string& service,
                                       const Payload& payload,
                                       const QoSProfile& qos,
-                                      uint32_t corrId);
+                                      uint32_t corrId,
+                                      std::chrono::milliseconds timeoutOverride =
+                                          std::chrono::milliseconds(0));
 
     void cancelPendingRequest(uint32_t corrId);
 
@@ -123,6 +127,11 @@ private:
     // SHM（仅同主机）> TCP > UDP。返回选定端点（无可用时返回首个/空端点）。
     Endpoint selectEndpoint(const PeerInfo& peer) const;
 
+    // 解析当前可达的服务提供方并发送一次 REQUEST；返回是否至少发往一个对端。
+    // 每次调用都重新读取 peers_ 解析路由，供首发与周期重传共用。
+    bool dispatchRequest(const std::string& service, const Payload& payload,
+                         const QoSProfile& qos, uint32_t corrId);
+
     uint16_t nodeId_;
     TransportManager* transportMgr_;
     std::string       localHostName_;
@@ -141,6 +150,16 @@ private:
     struct PendingRequest {
         std::promise<Payload>                 promise;
         std::chrono::steady_clock::time_point deadline;
+        // —— 远端请求重传上下文（本地服务直接应答，不登记 pending，下列字段不用）——
+        // 提供方的 $SVC 通告可能晚于请求发出，故保留载荷在截止时间内反复重传，
+        // 每次重传都重新解析路由，使提供方一旦可达即可送达（best-effort 单发会丢）。
+        bool                                  remote{false};
+        std::string                           service;
+        Payload                               payload;
+        QoSProfile                            qos;
+        uint32_t                              corrId{0};
+        std::chrono::steady_clock::time_point nextRetry;
+        std::chrono::milliseconds             retryInterval{0};
     };
     std::mutex pendingReqMutex_;
     std::unordered_map<uint32_t, PendingRequest> pendingRequests_;

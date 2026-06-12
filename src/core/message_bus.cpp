@@ -77,7 +77,11 @@ const std::string& Requester::service() const { return impl_->service; }
 std::optional<Payload> Requester::request(
     const Payload& payload, std::chrono::milliseconds timeout)
 {
-    auto fut = requestAsync(payload);
+    // 把调用方超时透传为内部截止时间，否则 sendRequest 只按 QoS 推导出较短的
+    // 截止时间（如 reliable 仅 2s），-t 指定的更长超时形同虚设。
+    impl_->lastCorrId = impl_->bus->corrCounter_++;
+    auto fut = impl_->bus->sendRequest(impl_->service, payload, impl_->qos,
+                                       impl_->lastCorrId, timeout);
     if (fut.wait_for(timeout) == std::future_status::ready) {
         // future 可能携带异常（无服务提供方 / 请求超时），同步接口统一返回 nullopt
         try { return fut.get(); }
@@ -168,9 +172,12 @@ void MessageBus::start(int cpuAffinity) {
         // 丢弃过期的保留消息，使保留消息内存占用有上界（TTL 默认关闭）。
         retainedStore_.expire();
 
-        // 请求超时：按截止时间结束仍在等待的请求，避免远端无响应时 future 永久挂起。
+        // 请求超时与重传：截止则结束 future；未截止的远端请求按 retryInterval
+        // 重新解析路由并重传——提供方上线后即可送达，修复"请求发出过早即丢失"。
         auto now = std::chrono::steady_clock::now();
         std::vector<std::promise<Payload>> expired;
+        struct RetryJob { std::string service; Payload payload; QoSProfile qos; uint32_t corrId; };
+        std::vector<RetryJob> retries;
         {
             std::lock_guard<std::mutex> lock(pendingReqMutex_);
             for (auto it = pendingRequests_.begin(); it != pendingRequests_.end(); ) {
@@ -178,9 +185,18 @@ void MessageBus::start(int cpuAffinity) {
                     expired.push_back(std::move(it->second.promise));
                     it = pendingRequests_.erase(it);
                 } else {
+                    auto& pr = it->second;
+                    if (pr.remote && now >= pr.nextRetry) {
+                        retries.push_back(RetryJob{ pr.service, pr.payload, pr.qos, pr.corrId });
+                        pr.nextRetry = now + pr.retryInterval;
+                    }
                     ++it;
                 }
             }
+        }
+        // 锁外重传：dispatchRequest 会取 peerMutex_，必须避免与 pendingReqMutex_ 嵌套。
+        for (auto& j : retries) {
+            dispatchRequest(j.service, j.payload, j.qos, j.corrId);
         }
         // 锁外设置异常，避免在持锁状态下执行 future 续延逻辑
         for (auto& p : expired) {
@@ -635,35 +651,53 @@ void MessageBus::cancelPendingRequest(uint32_t corrId) {
     pendingRequests_.erase(corrId);
 }
 
+bool MessageBus::dispatchRequest(const std::string& service, const Payload& payload,
+                                 const QoSProfile& qos, uint32_t corrId)
+{
+    const std::string svcTopic = "$SVC/" + service;
+    std::vector<Endpoint> targets;
+    {
+        std::lock_guard<std::mutex> lock(peerMutex_);
+        for (auto& [id, peer] : peers_) {
+            (void)id;
+            for (auto& t : peer.subscribedTopics) {
+                if (t == svcTopic) {
+                    if (!peer.endpoints.empty())
+                        targets.push_back(selectEndpoint(peer));
+                    break;
+                }
+            }
+        }
+    }
+    if (targets.empty()) return false;
+
+    uint32_t seqId = seqCounter_++;
+    auto data = MessageCodec::encode(
+        MessageType::REQUEST, nodeId_, 0xFFFF,
+        svcTopic, payload, qos, seqId, corrId, 0, 0, crcEnabled_);
+    for (auto& ep : targets) {
+        if (transportMgr_) transportMgr_->send(ep, data.data(), data.size());
+    }
+    return true;
+}
+
 std::future<Payload> MessageBus::sendRequest(const std::string& service,
                                                const Payload& payload,
                                                const QoSProfile& qos,
-                                               uint32_t corrId)
+                                               uint32_t corrId,
+                                               std::chrono::milliseconds timeoutOverride)
 {
     std::promise<Payload> promise;
     auto future = promise.get_future();
 
-    // 请求级截止时间：远端无响应时由 start() 的周期任务结束该 future。
-    uint64_t timeoutMs = qos.ackTimeoutMs
-        ? static_cast<uint64_t>(qos.ackTimeoutMs) * (qos.maxRetries + 1)
-        : 5000;
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(timeoutMs);
-    {
-        std::lock_guard<std::mutex> lock(pendingReqMutex_);
-        pendingRequests_[corrId] = PendingRequest{ std::move(promise), deadline };
-    }
-
-    // 先找本地的 service handler
+    // 先找本地的 service handler：本地服务直接调用并返回，不进入 pending。
     RequestHandler handler;
     {
         std::lock_guard<std::mutex> lock(serviceMutex_);
         auto it = serviceHandlers_.find(service);
         if (it != serviceHandlers_.end()) handler = it->second;
     }
-
     if (handler) {
-        // 本地服务：直接调用
         ReceivedMessage req;
         req.topic         = service;
         req.payload       = payload;
@@ -671,7 +705,46 @@ std::future<Payload> MessageBus::sendRequest(const std::string& service,
         req.sequenceId    = seqCounter_++;
         req.correlationId = corrId;
         Payload response  = handler(req);
+        try { promise.set_value(response); } catch (...) {}
+        return future;
+    }
 
+    // 远端服务：先登记 pending（携带重传上下文，确保随后到达的 REPLY 必能匹配），
+    // 再首发一次；其余交给周期任务重传。截止时间优先采用调用方显式 timeout，否则按
+    // QoS 推导。提供方的 $SVC 通告可能晚于本次请求到达，故不再在"暂无提供方"时一律
+    // 立即失败——只要还有活动传输能在后续发现提供方，就保留请求并反复重传，直到收到
+    // REPLY 或截止时间到达（与发布路径每次重新解析对端的行为对齐）。
+    uint64_t timeoutMs = timeoutOverride.count() > 0
+        ? static_cast<uint64_t>(timeoutOverride.count())
+        : (qos.ackTimeoutMs
+            ? static_cast<uint64_t>(qos.ackTimeoutMs) * (qos.maxRetries + 1)
+            : 5000);
+    auto now      = std::chrono::steady_clock::now();
+    auto deadline = now + std::chrono::milliseconds(timeoutMs);
+    std::chrono::milliseconds retryInterval(qos.ackTimeoutMs ? qos.ackTimeoutMs : 200);
+    {
+        std::lock_guard<std::mutex> lock(pendingReqMutex_);
+        PendingRequest pr;
+        pr.promise       = std::move(promise);
+        pr.deadline      = deadline;
+        pr.remote        = true;
+        pr.service       = service;
+        pr.payload       = payload;
+        pr.qos           = qos;
+        pr.corrId        = corrId;
+        pr.retryInterval = retryInterval;
+        pr.nextRetry     = now + retryInterval;
+        pendingRequests_[corrId] = std::move(pr);
+    }
+
+    bool sent = dispatchRequest(service, payload, qos, corrId);
+
+    // 既没有可达提供方，又没有任何活动传输能在后续发现提供方（如禁用 UDP/组播且
+    // 无 TCP/SHM），则等下去也不会有结果——立即结束，避免空等到调用方超时。
+    const bool canDiscover = transportMgr_ &&
+        (transportMgr_->isActive("udp") || transportMgr_->isActive("tcp") ||
+         transportMgr_->isActive("shm"));
+    if (!sent && !canDiscover) {
         std::promise<Payload> p;
         bool found = false;
         {
@@ -683,54 +756,13 @@ std::future<Payload> MessageBus::sendRequest(const std::string& service,
                 found = true;
             }
         }
-        if (found) { try { p.set_value(response); } catch (...) {} }
-    } else {
-        // 远端服务：编码为 REQUEST 并发送，携带 correlationId
-        std::string svcTopic = "$SVC/" + service;
-        std::vector<Endpoint> targets;
-        {
-            std::lock_guard<std::mutex> lock(peerMutex_);
-            for (auto& [id, peer] : peers_) {
-                for (auto& t : peer.subscribedTopics) {
-                    if (t == svcTopic) {
-                        if (!peer.endpoints.empty())
-                            targets.push_back(selectEndpoint(peer));
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (!targets.empty()) {
-            uint32_t seqId = seqCounter_++;
-            auto data = MessageCodec::encode(
-                MessageType::REQUEST, nodeId_, 0xFFFF,
-                svcTopic, payload, qos, seqId, corrId, 0, 0, crcEnabled_);
-            for (auto& ep : targets) {
-                if (transportMgr_) transportMgr_->send(ep, data.data(), data.size());
-            }
-        } else {
-            // 找不到提供该服务的对端：立即结束 future，避免永久挂起
-            std::promise<Payload> p;
-            bool found = false;
-            {
-                std::lock_guard<std::mutex> lock(pendingReqMutex_);
-                auto it = pendingRequests_.find(corrId);
-                if (it != pendingRequests_.end()) {
-                    p = std::move(it->second.promise);
-                    pendingRequests_.erase(it);
-                    found = true;
-                }
-            }
-            if (found) {
-                try {
-                    p.set_exception(std::make_exception_ptr(
-                        std::runtime_error("no provider for service: " + service)));
-                } catch (...) {}
-            }
+        if (found) {
+            try {
+                p.set_exception(std::make_exception_ptr(
+                    std::runtime_error("no provider for service: " + service)));
+            } catch (...) {}
         }
     }
-
     return future;
 }
 
