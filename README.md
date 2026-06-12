@@ -244,11 +244,12 @@ embedmq/
 │   │
 │   ├── platform/                 # 平台抽象层 (PAL)
 │   │   ├── event_loop.h          # 接口
-│   │   ├── event_loop_epoll.cpp  # Linux
-│   │   ├── event_loop_kqueue.cpp # macOS
-│   │   ├── event_loop_iocp.cpp   # Windows
-│   │   ├── socket_api.h + *.cpp  # 跨平台 Socket
-│   │   └── process.h             # PID / hostname / 临时目录
+│   │   ├── event_loop_epoll.cpp     # Linux
+│   │   ├── event_loop_io_uring.cpp  # Linux（io_uring，实验性，默认关）
+│   │   ├── event_loop_kqueue.cpp    # macOS
+│   │   ├── event_loop_iocp.cpp      # Windows
+│   │   ├── socket_api.h + *.cpp     # 跨平台 Socket
+│   │   └── process.h                # PID / hostname / 临时目录
 │   │
 │   ├── util/                     # 工具库（纯 C++17，无平台依赖）
 │   │   ├── crc32.h               # CRC32 校验
@@ -286,7 +287,9 @@ embedmq/
 │   ├── test_pub_sub.cpp          # 模块: pub_sub
 │   ├── test_req_rep.cpp          # 模块: req_rep
 │   ├── test_last_will.cpp        # 模块: last_will（遗嘱消息）
+│   ├── test_retained_store.cpp # 模块: retained_store（保留消息 TTL/上限）
 │   ├── test_phase3.cpp           # 模块: phase3（内存池/MPSC/SHM/亲和性/零拷贝）
+│   ├── test_refactor_v2.cpp    # 模块: refactor_v2（协议 v2 重构回归）
 │   ├── test_review_fixes.cpp     # 模块: review_fixes（审查修复回归）
 │   └── test_capi.cpp             # 模块: capi（C ABI 句柄/收发/错误码）
 │
@@ -303,15 +306,18 @@ embedmq/
 ├── tools/                        # 命令行工具（Phase 5）
 │   ├── emqtop/main.cpp           # 监控/收发/诊断 CLI（emqtop）
 │   ├── emq_stress/main.cpp       # 压力/稳定性测试（emq_stress）
+│   ├── emq_simnode/main.cpp      # 真实多节点模拟（UDP+多播，emq_simnode）
 │   └── measure_resources.sh      # 运行时资源占用采样脚本
 │
 ├── bench/
 │   └── bench_main.cpp            # 性能基准（emq_bench）
 │
 ├── docs/
-│   └── architecture.md           # 完整设计文档
+│   ├── architecture.md           # 完整设计文档
+│   └── todo.md                   # 已知遗留 / 路线图
 │
-└── xmake.lua                     # 构建脚本
+├── CMakeLists.txt                # 兼容构建脚本（与 xmake 同步维护）
+└── xmake.lua                     # 构建脚本（主）
 ```
 
 ---
@@ -484,6 +490,39 @@ Linux 6.18，glibc）** 中实测。`/proc` 周期采样统计资源占用。
 # 单节点模拟器（一个进程=一个网络节点；多开几个即组成 N 节点网格）
 emq_simnode node1 --topics 8 --duration 30 --rate 10 --payload 64
 ```
+
+**③ 与 ZeroMQ 横向对比（同一模拟器、同一 `/proc` 采样口径）**
+
+在相同场景下对比 EmbedMQ 与 ZeroMQ 4.3.5。为公平起见，ZeroMQ 用 **TCP 全网状 PUB/SUB**
+（每节点 1 个 PUB + 连接全部对端的 SUB，含自投递），与 emq 同为「全网格、人人收到人人」。
+
+> ⚠️ 两点口径：① 仍是 TCG 模拟，绝对值只作两者**相对比较**、RSS 最具代表性；
+> ② ZeroMQ 走可靠 TCP，emq 默认 BestEffort/UDP，ZMQ 每消息成本天然含 TCP 可靠性开销。
+
+稳态（8 节点 × 10Hz × 64B × 30s，每节点均值）：
+
+| 指标（每节点） | EmbedMQ (UDP) | ZeroMQ (TCP) |
+|------|------|------|
+| RSS 常驻内存 | **3.24 MB** | 4.32 MB（~1.3×）|
+| CPU（单核%）| 4.1% | 3.1% |
+| 线程 | 4 | 4 |
+| 丢包 | 0% | 0% |
+
+吞吐天花板（2 节点不限速狂发）：
+
+| 指标 | EmbedMQ (UDP) | ZeroMQ (TCP) |
+|------|------|------|
+| 有效吞吐（交付）| 63 K msg/s | 76 K msg/s |
+| 投递成功率 | 99.7% | 19.1% |
+| RSS / 节点 | **3.23 MB** | 74.7 MB |
+
+要点：
+
+- **稳态**两者吞吐 / CPU / 线程相当、均零丢包，emq 内存更省（~3.2 vs ~4.3 MB）。
+- **分水岭在过载背压策略**：emq BestEffort/UDP 发不出即丢、发送端自我限速，内存稳定可预测；
+  ZeroMQ 的 PUB 按 HWM 在发送端缓冲，峰值有效吞吐略高，但 RSS 飙至 ~75 MB 且 ~80% 尝试被丢。
+- 面向资源受限的嵌入式 / 边缘场景，emq 以更低且**可预测**的内存提供了对等稳态吞吐；
+  ZeroMQ 通用性、生态更强。（完整方法学与原始数据见 `simu` 仓库的 `emq-vs-zeromq.md`。）
 
 ---
 

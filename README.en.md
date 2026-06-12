@@ -244,11 +244,12 @@ embedmq/
 │   │
 │   ├── platform/                 # Platform Abstraction Layer (PAL)
 │   │   ├── event_loop.h          # Interface
-│   │   ├── event_loop_epoll.cpp  # Linux
-│   │   ├── event_loop_kqueue.cpp # macOS
-│   │   ├── event_loop_iocp.cpp   # Windows
-│   │   ├── socket_api.h + *.cpp  # Cross-platform sockets
-│   │   └── process.h             # PID / hostname / temp dir
+│   │   ├── event_loop_epoll.cpp     # Linux
+│   │   ├── event_loop_io_uring.cpp  # Linux (io_uring, experimental, off by default)
+│   │   ├── event_loop_kqueue.cpp    # macOS
+│   │   ├── event_loop_iocp.cpp      # Windows
+│   │   ├── socket_api.h + *.cpp     # Cross-platform sockets
+│   │   └── process.h                # PID / hostname / temp dir
 │   │
 │   ├── util/                     # Utilities (pure C++17, no platform deps)
 │   │   ├── crc32.h               # CRC32
@@ -286,7 +287,9 @@ embedmq/
 │   ├── test_pub_sub.cpp          # module: pub_sub
 │   ├── test_req_rep.cpp          # module: req_rep
 │   ├── test_last_will.cpp        # module: last_will
+│   ├── test_retained_store.cpp # module: retained_store (retained msg TTL/cap)
 │   ├── test_phase3.cpp           # module: phase3 (pool/MPSC/SHM/affinity/zero-copy)
+│   ├── test_refactor_v2.cpp    # module: refactor_v2 (wire v2 refactor regression)
 │   ├── test_review_fixes.cpp     # module: review_fixes
 │   └── test_capi.cpp             # module: capi (C ABI handles/I/O/error codes)
 │
@@ -303,15 +306,18 @@ embedmq/
 ├── tools/                        # CLI tools (Phase 5)
 │   ├── emqtop/main.cpp           # Monitor/publish/diagnostics (emqtop)
 │   ├── emq_stress/main.cpp       # Stress/stability (emq_stress)
+│   ├── emq_simnode/main.cpp      # Real multi-node simulation (UDP+multicast, emq_simnode)
 │   └── measure_resources.sh      # Runtime resource sampling script
 │
 ├── bench/
 │   └── bench_main.cpp            # Benchmarks (emq_bench)
 │
 ├── docs/
-│   └── architecture.md           # Full design document
+│   ├── architecture.md           # Full design document
+│   └── todo.md                   # Known gaps / roadmap
 │
-└── xmake.lua                     # Build script
+├── CMakeLists.txt                # Compatibility build script (kept in sync with xmake)
+└── xmake.lua                     # Build script (primary)
 ```
 
 ---
@@ -484,6 +490,44 @@ Takeaways:
 # One simulated node (one process = one network node; spawn several for an N-node mesh)
 emq_simnode node1 --topics 8 --duration 30 --rate 10 --payload 64
 ```
+
+**③ Head-to-head vs ZeroMQ (same simulator, same `/proc` sampling)**
+
+EmbedMQ compared against ZeroMQ 4.3.5 under identical scenarios. For fairness, ZeroMQ uses
+**TCP full-mesh PUB/SUB** (each node 1 PUB + a SUB connected to every peer, self included),
+so both are "full-mesh, everyone receives everyone."
+
+> ⚠️ Two caveats: ① still under TCG emulation — absolute numbers are for emq↔ZMQ
+> **relative** comparison only, RSS is the most representative; ② ZeroMQ runs over reliable
+> TCP while emq defaults to BestEffort/UDP, so ZMQ's per-message cost includes TCP reliability.
+
+Steady-state (8 nodes × 10Hz × 64B × 30s, per-node avg):
+
+| Metric (per node) | EmbedMQ (UDP) | ZeroMQ (TCP) |
+|------|------|------|
+| RSS | **3.24 MB** | 4.32 MB (~1.3×) |
+| CPU (% of one core) | 4.1% | 3.1% |
+| Threads | 4 | 4 |
+| Loss | 0% | 0% |
+
+Throughput ceiling (2 nodes, unthrottled blast):
+
+| Metric | EmbedMQ (UDP) | ZeroMQ (TCP) |
+|------|------|------|
+| Effective throughput (delivered) | 63 K msg/s | 76 K msg/s |
+| Delivery success rate | 99.7% | 19.1% |
+| RSS / node | **3.23 MB** | 74.7 MB |
+
+Takeaways:
+
+- **Steady-state**: comparable throughput / CPU / threads, both zero-loss; emq uses less memory (~3.2 vs ~4.3 MB).
+- **The divergence is the back-pressure strategy under overload**: emq's BestEffort/UDP drops
+  immediately and self-throttles at the sender, keeping memory stable and predictable; ZeroMQ's
+  PUB buffers at the sender up to its HWM — slightly higher peak throughput, but RSS balloons to
+  ~75 MB and ~80% of attempts are dropped.
+- For resource-constrained embedded / edge use, emq delivers equivalent steady-state throughput at
+  lower, **predictable** memory; ZeroMQ wins on generality and ecosystem. (Full methodology and raw
+  data in the `simu` repo's `emq-vs-zeromq.md`.)
 
 ---
 
